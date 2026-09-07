@@ -40,6 +40,26 @@ export const STORAGE_KEYS = {
 };
 
 /**
+ * Firebase storageBucket 문자열 정규화 헬퍼
+ * @param rawBucket 원본 버킷 설정값
+ * @param projectId Firebase 프로젝트 ID
+ * @returns {string} 정규화된 버킷 이름 (예: my-project.firebasestorage.app)
+ */
+function normalizeStorageBucket(rawBucket: string | undefined, projectId: string): string {
+  if (!rawBucket || !rawBucket.trim()) {
+    return `${projectId}.firebasestorage.app`;
+  }
+  let cleaned = rawBucket.trim();
+  if (cleaned.startsWith('gs://')) {
+    cleaned = cleaned.replace('gs://', '');
+  }
+  if (cleaned.endsWith('/')) {
+    cleaned = cleaned.slice(0, -1);
+  }
+  return cleaned;
+}
+
+/**
  * 환경 변수 또는 로컬 오버라이드에서 Firebase 설정을 로드하는 함수
  * @returns {FirebaseClientConfig | null} Firebase 설정 객체 또는 미설정 시 null
  */
@@ -53,7 +73,10 @@ export function getFirebaseConfig(): FirebaseClientConfig | null {
       const parsed = JSON.parse(override) as FirebaseClientConfig;
       if (parsed.apiKey && parsed.projectId) {
         logger.info('Firebase config loaded from localStorage override');
-        return parsed;
+        return {
+          ...parsed,
+          storageBucket: normalizeStorageBucket(parsed.storageBucket, parsed.projectId),
+        };
       }
     }
   } catch (e) {
@@ -76,7 +99,7 @@ export function getFirebaseConfig(): FirebaseClientConfig | null {
       apiKey,
       authDomain: authDomain || `${projectId}.firebaseapp.com`,
       projectId,
-      storageBucket: storageBucket || `${projectId}.firebasestorage.app`,
+      storageBucket: normalizeStorageBucket(storageBucket, projectId),
       messagingSenderId,
       appId,
       measurementId,

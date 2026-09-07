@@ -328,6 +328,7 @@ export interface Meeting {
   
   // 녹음 및 대화록
   recording?: RecordingMetadata;
+  recordedDurationSeconds?: number; // 총 녹음 지속 시간(초) 영구 보존
   recordingStatus?: MeetingRecordingStatus;
   transcriptionStatus?: MeetingTranscriptionStatus;
   summaryStatus?: MeetingSummaryStatus;

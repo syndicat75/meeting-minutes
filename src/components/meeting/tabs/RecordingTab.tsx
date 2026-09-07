@@ -43,6 +43,7 @@ import {
 } from '../../../services/transcriptionClientService';
 import { uploadRecordingAudio } from '../../../services/storageService';
 import { removeAudioSession } from '../../../services/indexedDbAudio';
+import { getFirebaseAuth } from '../../../services/firebase';
 import { formatDuration, formatFileSize } from '../../../utils/formatters';
 import { APP_CONFIG } from '../../../config/appConfig';
 import { logger } from '../../../utils/logger';
@@ -78,7 +79,15 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
   // 녹음기 상태
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [isPaused, setIsPaused] = useState<boolean>(false);
-  const [recordDuration, setRecordDuration] = useState<number>(0);
+  const [recordDuration, setRecordDuration] = useState<number>(
+    meeting.recordedDurationSeconds || meeting.recording?.durationSeconds || 0
+  );
+  // 녹음 완료 후 타이머가 00:00:00으로 리셋되지 않도록 지속 보존하는 상태
+  const [lastRecordedDuration, setLastRecordedDuration] = useState<number>(
+    meeting.recordedDurationSeconds || meeting.recording?.durationSeconds || 0
+  );
+  const [isFinalizing, setIsFinalizing] = useState<boolean>(false);
+  const [retryingChunkId, setRetryingChunkId] = useState<string | null>(null);
   const [inputVolume, setInputVolume] = useState<number>(0);
   const [activeChunkIndex, setActiveChunkIndex] = useState<number>(1);
 
@@ -126,7 +135,14 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         })
         .catch((e) => logger.warn('Failed to load chunks from Firestore', e));
     }
-  }, [meeting.id, meeting.audioChunks]);
+    if (meeting.recordedDurationSeconds || meeting.recording?.durationSeconds) {
+      const savedDuration = meeting.recordedDurationSeconds || meeting.recording?.durationSeconds || 0;
+      setLastRecordedDuration(savedDuration);
+      if (!isRecording) {
+        setRecordDuration(savedDuration);
+      }
+    }
+  }, [meeting.id, meeting.audioChunks, meeting.recordedDurationSeconds, meeting.recording?.durationSeconds]);
 
   // 언마운트 시 활성 녹음 정리
   useEffect(() => {
@@ -147,15 +163,17 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
     endSeconds: number
   ) => {
     const currentMeetingId = activeMeetingIdRef.current;
+    // 정렬 가능한 4자리 chunkId 표준화
+    const chunkId = `chunk_${String(chunkIndex).padStart(4, '0')}`;
+
     logger.info('handleChunkReady triggered', {
       meetingId: currentMeetingId,
+      chunkId,
       chunkIndex,
       startSeconds,
       endSeconds,
       blobSize: blob.size,
     });
-
-    const chunkId = `chunk_${String(chunkIndex).padStart(3, '0')}`;
 
     // 낙관적 UI 업데이트
     setChunks((prev) => {
@@ -167,8 +185,8 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         index: chunkIndex,
         startSeconds,
         endSeconds,
-        duration: endSeconds - startSeconds,
-        durationSeconds: endSeconds - startSeconds,
+        duration: Math.max(1, endSeconds - startSeconds),
+        durationSeconds: Math.max(1, endSeconds - startSeconds),
         size: blob.size,
         fileSizeBytes: blob.size,
         mimeType: blob.type || 'audio/webm',
@@ -195,16 +213,28 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
       // 성공한 청크로 로컬 상태 갱신
       setChunks((prev) => {
         const updated = prev.map((c) => (c.id === chunkId ? savedChunk : c));
-        onUpdateMeeting({ audioChunks: updated });
+        const upCount = updated.filter((c) => c.uploadStatus === 'uploaded').length;
+        onUpdateMeeting({
+          audioChunks: updated,
+          uploadedChunksCount: upCount,
+          totalChunksCount: updated.length,
+        });
         return updated;
       });
     } catch (err: any) {
       logger.error('Failed to process and upload chunk', { chunkId, err });
       setChunks((prev) => {
         const updated = prev.map((c) =>
-          c.id === chunkId ? { ...c, uploadStatus: 'failed' as const, errorMessage: err.message } : c
+          c.id === chunkId
+            ? { ...c, uploadStatus: 'failed' as const, errorMessage: err.message || '저장 실패' }
+            : c
         );
-        onUpdateMeeting({ audioChunks: updated });
+        const upCount = updated.filter((c) => c.uploadStatus === 'uploaded').length;
+        onUpdateMeeting({
+          audioChunks: updated,
+          uploadedChunksCount: upCount,
+          totalChunksCount: updated.length,
+        });
         return updated;
       });
     }
@@ -220,8 +250,19 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
       return;
     }
 
+    // 1. Storage 업로드 필수 전제 조건: Firebase 로그인 상태 확인
+    const auth = getFirebaseAuth();
+    if (!auth?.currentUser) {
+      setErrorMessage('회의 음성 클라우드(Storage) 저장을 위해 먼저 상단 우측 [Google 로그인]을 완료해주세요.');
+      return;
+    }
+
     setErrorMessage(null);
     setMaxDurationAlert(false);
+
+    // 새 녹음 시작 시 타이머 초기화
+    setRecordDuration(0);
+    setLastRecordedDuration(0);
 
     try {
       const recorder = new ChunkAudioRecorder({
@@ -284,8 +325,15 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
     logger.info('handleStopRecording called');
     if (!recorderRef.current) return;
 
+    setIsFinalizing(true);
+    setErrorMessage(null);
+
     try {
       const { totalDurationSeconds } = await recorderRef.current.stop();
+
+      // 녹음 종료 후에도 메인 타이머 시간(초) 보존
+      setRecordDuration(totalDurationSeconds);
+      setLastRecordedDuration(totalDurationSeconds);
       setIsRecording(false);
       setIsPaused(false);
 
@@ -293,11 +341,15 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
       setChunks(latestChunks);
 
       const totalBytes = latestChunks.reduce((acc, c) => acc + (c.size || c.fileSizeBytes || 0), 0);
+      const upCount = latestChunks.filter((c) => c.uploadStatus === 'uploaded').length;
+      const failCount = latestChunks.filter((c) => c.uploadStatus === 'failed').length;
+
+      const firstUploaded = latestChunks.find((c) => c.uploadStatus === 'uploaded');
 
       const metadata: RecordingMetadata = {
         id: 'rec_' + Date.now(),
-        storagePath: latestChunks[0]?.storagePath || '',
-        downloadUrl: latestChunks[0]?.downloadUrl,
+        storagePath: firstUploaded?.storagePath || latestChunks[0]?.storagePath || '',
+        downloadUrl: firstUploaded?.downloadUrl,
         durationSeconds: totalDurationSeconds,
         fileSizeBytes: totalBytes,
         mimeType: 'audio/webm',
@@ -308,34 +360,57 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
 
       onUpdateMeeting({
         recording: metadata,
+        recordedDurationSeconds: totalDurationSeconds,
         recordingStatus: 'completed',
         audioChunks: latestChunks,
+        uploadedChunksCount: upCount,
+        totalChunksCount: latestChunks.length,
       });
 
+      if (failCount > 0) {
+        setErrorMessage(
+          `전체 ${latestChunks.length}개 구간 중 ${failCount}개 구간의 클라우드 저장에 실패했습니다. 아래 [저장 재시도] 버튼을 눌러 다시 저장해주세요.`
+        );
+      } else {
+        logger.info('Recording stopped and all chunks finalized successfully');
+      }
+
       await removeAudioSession(meeting.id);
-      logger.info('Recording stopped and finalized successfully');
     } catch (err: any) {
       logger.error('Error stopping recording', err);
       setErrorMessage(`녹음 종료 중 오류: ${err.message}`);
+    } finally {
+      setIsFinalizing(false);
     }
   };
 
   /**
-   * 실패한 단일 청크 수동 업로드 재시도
+   * 실패한 단일 청크 수동 업로드 재시도 (로컬 IndexedDB -> Storage)
    */
   const handleRetryChunkUpload = async (chunk: AudioChunk) => {
     logger.info('handleRetryChunkUpload called', { chunkId: chunk.id });
+    setRetryingChunkId(chunk.id);
+    setErrorMessage(null);
+
     try {
       const updated = await retryFailedAudioChunk(meeting.id, chunk.id);
       if (updated) {
         setChunks((prev) => {
           const list = prev.map((c) => (c.id === chunk.id ? updated : c));
-          onUpdateMeeting({ audioChunks: list });
+          const upCount = list.filter((c) => c.uploadStatus === 'uploaded').length;
+          onUpdateMeeting({
+            audioChunks: list,
+            uploadedChunksCount: upCount,
+            totalChunksCount: list.length,
+          });
           return list;
         });
       }
     } catch (err: any) {
-      setErrorMessage(`청크 ${chunk.id} 재업로드 실패: ${err.message}`);
+      logger.error('Retry chunk upload failed', { chunkId: chunk.id, error: err });
+      setErrorMessage(`청크 ${chunk.id} 재저장 실패: ${err.message || 'Storage 연결을 확인해주세요.'}`);
+    } finally {
+      setRetryingChunkId(null);
     }
   };
 
@@ -518,8 +593,54 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
   // 통계 계산
   const totalChunksCount = chunks.length;
   const uploadedChunksCount = chunks.filter((c) => c.uploadStatus === 'uploaded').length;
+  const failedUploadChunksCount = chunks.filter((c) => c.uploadStatus === 'failed').length;
+  const uploadingChunksCount = chunks.filter((c) => c.uploadStatus === 'uploading').length;
   const transcribedChunksCount = chunks.filter((c) => c.transcriptionStatus === 'completed').length;
-  const failedTranscribeCount = chunks.filter((c) => c.transcriptionStatus === 'failed').length;
+  const failedTranscribeCount = chunks.filter(
+    (c) => c.uploadStatus === 'uploaded' && c.transcriptionStatus === 'failed'
+  ).length;
+
+  // 전체 청크 저장 성공 여부 (모든 청크가 업로드 완료되어야 함)
+  const isAllChunksUploaded = totalChunksCount > 0 && uploadedChunksCount === totalChunksCount;
+  // AI 전사 시작 가능 여부 (모든 청크 저장 완료 & 녹음 중/정리 중이 아님)
+  const canStartBatchTranscribe =
+    isAllChunksUploaded && !isTranscribing && !isRecording && !isFinalizing;
+
+  // 표시할 타이머 시간(초) - 녹음 중지 후에도 00:00:00 리셋 방지
+  const displayDurationSeconds = isRecording
+    ? recordDuration
+    : (lastRecordedDuration ||
+       recordDuration ||
+       meeting.recordedDurationSeconds ||
+       meeting.recording?.durationSeconds ||
+       chunks.reduce((acc, c) => acc + (c.durationSeconds || c.duration || 0), 0) ||
+       0);
+
+  // 상단 상태 문구 결정 함수 (상태 불일치 100% 방지)
+  const getStatusText = () => {
+    if (isRecording && !isPaused) {
+      return `실시간 녹음 중 (현재 제${activeChunkIndex}구간)`;
+    }
+    if (isPaused) {
+      return '녹음 일시 정지됨';
+    }
+    if (isFinalizing) {
+      return '녹음 완료 및 마지막 구간 클라우드 저장 중...';
+    }
+    if (failedUploadChunksCount > 0) {
+      return `녹음 저장 실패 (${uploadedChunksCount}/${totalChunksCount} 구간 저장 완료, ${failedUploadChunksCount}개 실패)`;
+    }
+    if (uploadingChunksCount > 0) {
+      return `녹음 구간 클라우드 저장 진행 중 (${uploadedChunksCount}/${totalChunksCount})`;
+    }
+    if (totalChunksCount > 0) {
+      if (uploadedChunksCount === totalChunksCount) {
+        return `${uploadedChunksCount}개 구간 저장 완료`;
+      }
+      return `${uploadedChunksCount}/${totalChunksCount}개 구간 저장 완료`;
+    }
+    return '녹음 대기 중';
+  };
 
   return (
     <div className="space-y-6">
@@ -547,7 +668,10 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
       {errorMessage && (
         <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex items-start space-x-3 text-red-800 text-xs">
           <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
-          <div className="flex-1">{errorMessage}</div>
+          <div className="flex-1 space-y-1">
+            <div className="font-bold">안내 및 오류</div>
+            <div className="leading-relaxed">{errorMessage}</div>
+          </div>
           <button onClick={() => setErrorMessage(null)} className="font-bold text-red-600 hover:text-red-800">
             닫기
           </button>
@@ -576,7 +700,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                 onUpdateMeeting({ recording: { ...meeting.recording, isConsentGiven: e.target.checked } });
               }
             }}
-            disabled={isReadOnly || isRecording}
+            disabled={isReadOnly || isRecording || isFinalizing}
             className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
           />
           <span>[필수] 모든 참석자에게 회의 녹음 및 AI 대화록 처리를 사전 고지하고 동의를 확인하였습니다.</span>
@@ -586,13 +710,9 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
       {/* 녹음 콘솔 메인 카드 */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-6">
         <div className="text-center space-y-2">
-          {/* 타이머 */}
+          {/* 타이머: 28초 등 녹음 완료 후 00:00:00 리셋 방지 */}
           <div className="text-4xl sm:text-5xl font-mono font-bold text-slate-900 tracking-wider">
-            {isRecording
-              ? formatSeconds(recordDuration)
-              : meeting.recording
-              ? formatSeconds(meeting.recording.durationSeconds)
-              : '00:00:00'}
+            {formatSeconds(displayDurationSeconds)}
           </div>
 
           {/* 상태 배지 */}
@@ -603,28 +723,39 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                   ? 'bg-red-500 animate-ping'
                   : isPaused
                   ? 'bg-amber-500'
-                  : totalChunksCount > 0
+                  : isFinalizing || uploadingChunksCount > 0
+                  ? 'bg-blue-500 animate-pulse'
+                  : failedUploadChunksCount > 0
+                  ? 'bg-red-500'
+                  : totalChunksCount > 0 && isAllChunksUploaded
                   ? 'bg-green-500'
                   : 'bg-slate-300'
               }`}
             />
-            <span className="font-semibold text-slate-600">
-              {isRecording && !isPaused
-                ? `실시간 녹음 중 (현재 ${activeChunkIndex}구간)`
-                : isPaused
-                ? '녹음 일시 정지됨'
-                : totalChunksCount > 0
-                ? `${totalChunksCount}개 구간 저장 완료`
-                : '녹음 대기 중'}
+            <span
+              className={`font-semibold ${
+                failedUploadChunksCount > 0 ? 'text-red-700 font-bold' : 'text-slate-700'
+              }`}
+            >
+              {getStatusText()}
             </span>
           </div>
 
           {/* 실시간 5분 청크 저장 현황 배지 */}
           {totalChunksCount > 0 && (
-            <div className="inline-flex items-center space-x-2 px-3 py-1 bg-blue-50 text-blue-800 rounded-full text-xs font-semibold border border-blue-100 mt-1">
-              <Layers className="w-3.5 h-3.5 text-blue-600" />
+            <div
+              className={`inline-flex items-center space-x-2 px-3 py-1 rounded-full text-xs font-semibold border mt-1 ${
+                failedUploadChunksCount > 0
+                  ? 'bg-red-50 text-red-800 border-red-200'
+                  : isAllChunksUploaded
+                  ? 'bg-green-50 text-green-800 border-green-200'
+                  : 'bg-blue-50 text-blue-800 border-blue-200'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5" />
               <span>
                 {uploadedChunksCount} / {totalChunksCount} 구간 저장 완료 (5분 자동 분할)
+                {failedUploadChunksCount > 0 && ` • ${failedUploadChunksCount}구간 저장 실패`}
               </span>
             </div>
           )}
@@ -652,7 +783,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         {/* 녹음 제어 버튼 군 */}
         {!isReadOnly && (
           <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
-            {!isRecording ? (
+            {!isRecording && !isFinalizing ? (
               <button
                 type="button"
                 id="btn-start-chunk-recording"
@@ -662,6 +793,15 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
               >
                 <Mic className="w-5 h-5" />
                 <span>마이크 녹음 시작</span>
+              </button>
+            ) : isFinalizing ? (
+              <button
+                type="button"
+                disabled
+                className="flex items-center space-x-2 px-6 py-3 bg-slate-800 text-white font-bold text-sm rounded-xl opacity-90 cursor-wait shadow"
+              >
+                <RefreshCw className="w-5 h-5 animate-spin text-blue-400" />
+                <span>마지막 구간 클라우드 저장 중...</span>
               </button>
             ) : (
               <>
@@ -689,7 +829,8 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                   type="button"
                   id="btn-stop-chunk-recording"
                   onClick={handleStopRecording}
-                  className="flex items-center space-x-1.5 px-5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl transition-colors"
+                  disabled={isFinalizing}
+                  className="flex items-center space-x-1.5 px-5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl transition-colors disabled:opacity-60"
                 >
                   <Square className="w-4 h-4 text-red-400" />
                   <span>녹음 완료 및 저장</span>
@@ -698,7 +839,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
             )}
 
             {/* 외부 오디오 파일 업로드 */}
-            {!isRecording && (
+            {!isRecording && !isFinalizing && (
               <>
                 <button
                   type="button"
@@ -758,7 +899,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
             {/* 일괄 전사 및 요약 액션 버튼 군 */}
             {!isReadOnly && !isRecording && (
               <div className="flex items-center space-x-2 flex-wrap">
-                {failedTranscribeCount > 0 && (
+                {failedTranscribeCount > 0 && isAllChunksUploaded && (
                   <button
                     type="button"
                     onClick={() => handleBatchTranscribe(true)}
@@ -770,26 +911,33 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                   </button>
                 )}
 
-                <button
-                  type="button"
-                  id="btn-batch-transcribe"
-                  onClick={() => handleBatchTranscribe(false)}
-                  disabled={isTranscribing}
-                  className="flex items-center space-x-1.5 px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-bold rounded-lg shadow-sm transition-all disabled:opacity-60"
-                >
-                  {isTranscribing ? (
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <Sparkles className="w-3.5 h-3.5 text-amber-300" />
-                  )}
-                  <span>
-                    {isTranscribing
-                      ? 'AI 전사 진행 중...'
-                      : transcribedChunksCount > 0
-                      ? '전체 구간 재전사'
-                      : '전체 구간 AI 화자 분리 전사'}
-                  </span>
-                </button>
+                <div className="relative group">
+                  <button
+                    type="button"
+                    id="btn-batch-transcribe"
+                    onClick={() => handleBatchTranscribe(false)}
+                    disabled={!canStartBatchTranscribe}
+                    title={
+                      !isAllChunksUploaded
+                        ? '모든 구간 파일이 클라우드에 안전하게 저장 완료된 후 AI 전사를 시작할 수 있습니다.'
+                        : '전체 회의 구간 AI 화자 분리 전사 시작'
+                    }
+                    className="flex items-center space-x-1.5 px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-bold rounded-lg shadow-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {isTranscribing ? (
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                    )}
+                    <span>
+                      {isTranscribing
+                        ? 'AI 전사 진행 중...'
+                        : transcribedChunksCount > 0
+                        ? '전체 구간 재전사'
+                        : '전체 구간 AI 화자 분리 전사'}
+                    </span>
+                  </button>
+                </div>
 
                 {transcribedChunksCount > 0 && (
                   <button
@@ -809,6 +957,18 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
               </div>
             )}
           </div>
+
+          {/* 저장 실패 경고 알림 */}
+          {failedUploadChunksCount > 0 && !isRecording && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center justify-between text-xs text-red-800">
+              <span className="flex items-center">
+                <AlertTriangle className="w-4 h-4 text-red-600 mr-2 shrink-0" />
+                <span>
+                  클라우드 저장에 실패한 구간({failedUploadChunksCount}개)이 있습니다. AI 전사를 진행하려면 각 구간의 <strong>[저장 재시도]</strong>를 먼저 완료해야 합니다.
+                </span>
+              </span>
+            </div>
+          )}
 
           {/* 일괄 전사 진행 상태 표시줄 */}
           {isTranscribing && (
@@ -949,9 +1109,20 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                       <button
                         type="button"
                         onClick={() => handleRetryChunkUpload(chunk)}
-                        className="px-2 py-1 bg-red-600 text-white rounded text-[11px] font-bold hover:bg-red-500"
+                        disabled={retryingChunkId === chunk.id}
+                        className="flex items-center space-x-1 px-2.5 py-1 bg-red-600 text-white rounded text-[11px] font-bold hover:bg-red-500 disabled:opacity-60 transition-colors"
                       >
-                        저장 재시도
+                        {retryingChunkId === chunk.id ? (
+                          <>
+                            <RefreshCw className="w-3 h-3 animate-spin" />
+                            <span>저장 중...</span>
+                          </>
+                        ) : (
+                          <>
+                            <RotateCcw className="w-3 h-3" />
+                            <span>저장 재시도</span>
+                          </>
+                        )}
                       </button>
                     )}
 

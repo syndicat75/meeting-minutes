@@ -63,38 +63,60 @@ export async function processAndUploadAudioChunk(
   startSeconds: number,
   endSeconds: number
 ): Promise<AudioChunk> {
+  // 정렬 가능한 4자리 chunkId 표준화 (예: chunk_0001)
+  const normalizedChunkId = `chunk_${String(index).padStart(4, '0')}`;
+
   logger.info('processAndUploadAudioChunk called', {
     meetingId,
-    chunkId,
+    chunkId: normalizedChunkId,
     index,
-    sizeBytes: blob.size,
+    sizeBytes: blob?.size,
     startSeconds,
     endSeconds,
   });
 
   const duration = Math.max(1, Math.round(endSeconds - startSeconds));
   const extension = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('m4a') ? 'm4a' : 'webm';
-  const fileName = `${chunkId}.${extension}`;
+  const fileName = `${normalizedChunkId}.${extension}`;
   const storagePath = `meetings/${meetingId}/audio/chunks/${fileName}`;
 
-  // 1. 브라우저 비정상 종료 대비 로컬 IndexedDB에 원본 Blob 즉시 보존
-  try {
-    await save5MinChunkBlob(meetingId, chunkId, index, blob, mimeType, startSeconds, endSeconds);
-    logger.debug('Chunk backed up in IndexedDB successfully', { chunkId });
-  } catch (idbErr) {
-    logger.warn('Failed to backup chunk in IndexedDB, continuing with upload', { chunkId, error: String(idbErr) });
+  // 1. WebM Blob 유효성 사전 검증
+  if (!blob || blob.size === 0) {
+    const zeroSizeErr = new Error('오디오 청크 데이터가 비어 있습니다 (0 bytes).');
+    (zeroSizeErr as any).code = 'storage/empty-blob';
+    console.error('[audio-chunk-upload]', {
+      code: 'storage/empty-blob',
+      message: zeroSizeErr.message,
+      name: zeroSizeErr.name,
+      meetingId,
+      chunkId: normalizedChunkId,
+      storagePath,
+      blobSize: blob ? blob.size : 0,
+      mimeType,
+    });
+    throw zeroSizeErr;
   }
 
-  // 2. 초기 청크 메타데이터 객체 준비
+  // 2. 브라우저 비정상 종료 대비 로컬 IndexedDB에 원본 Blob 즉시 보존
+  try {
+    await save5MinChunkBlob(meetingId, normalizedChunkId, index, blob, mimeType, startSeconds, endSeconds);
+    logger.debug('Chunk backed up in IndexedDB successfully', { chunkId: normalizedChunkId });
+  } catch (idbErr) {
+    logger.warn('Failed to backup chunk in IndexedDB, continuing with upload', { chunkId: normalizedChunkId, error: String(idbErr) });
+  }
+
+  // 3. 초기 청크 메타데이터 객체 준비
   const chunkData: AudioChunk = {
-    id: chunkId,
+    id: normalizedChunkId,
     meetingId,
     index,
     storagePath,
     startSeconds,
     endSeconds,
     duration,
+    durationSeconds: duration,
     size: blob.size,
+    fileSizeBytes: blob.size,
     mimeType,
     uploadStatus: 'uploading',
     transcriptionStatus: 'pending',
@@ -104,53 +126,66 @@ export async function processAndUploadAudioChunk(
 
   // Firestore에 uploading 상태 기록 (초기 등록)
   try {
-    const chunkRef = getChunkDocRef(meetingId, chunkId);
+    const chunkRef = getChunkDocRef(meetingId, normalizedChunkId);
     await setDoc(chunkRef, chunkData, { merge: true });
   } catch (fsErr) {
-    logger.warn('Failed to save initial chunk status to Firestore', { chunkId, error: String(fsErr) });
+    logger.warn('Failed to save initial chunk status to Firestore', { chunkId: normalizedChunkId, error: String(fsErr) });
   }
 
-  // 3. Firebase Storage에 직접 업로드 (지수 백오프 3회 자동 재시도 포함)
+  // 4. Firebase Storage에 직접 업로드 (지수 백오프 3회 자동 재시도 포함)
   try {
-    const { downloadUrl } = await uploadAudioChunkToStorage(meetingId, chunkId, blob, mimeType);
+    const { downloadUrl } = await uploadAudioChunkToStorage(meetingId, normalizedChunkId, blob, mimeType);
 
     chunkData.uploadStatus = 'uploaded';
     chunkData.downloadUrl = downloadUrl;
+    chunkData.errorMessage = undefined;
 
-    // Firestore에 업로드 완료 상태 갱신
+    // Firestore에 업로드 완료 상태 갱신 (Storage 성공 후에만 'uploaded' 기록)
     try {
-      const chunkRef = getChunkDocRef(meetingId, chunkId);
+      const chunkRef = getChunkDocRef(meetingId, normalizedChunkId);
       await setDoc(
         chunkRef,
         {
           uploadStatus: 'uploaded',
           downloadUrl,
+          errorMessage: null,
           updatedAt: new Date().toISOString(),
         },
         { merge: true }
       );
     } catch (fsErr) {
-      logger.error('Failed to update chunk uploaded status in Firestore', { chunkId, error: fsErr });
+      logger.error('Failed to update chunk uploaded status in Firestore', { chunkId: normalizedChunkId, error: fsErr });
     }
 
     // IndexedDB에 업로드 완료 마킹
     try {
-      await mark5MinChunkUploaded(meetingId, chunkId);
+      await mark5MinChunkUploaded(meetingId, normalizedChunkId);
     } catch {
       // 무시
     }
 
-    logger.info('Audio chunk upload fully succeeded', { chunkId, storagePath });
+    logger.info('Audio chunk upload fully succeeded', { chunkId: normalizedChunkId, storagePath });
     return chunkData;
   } catch (uploadErr: any) {
     const errorMessage = uploadErr?.message || 'Storage 업로드에 실패했습니다.';
-    logger.error('Audio chunk upload permanently failed', { chunkId, errorMessage });
+
+    // 요구사항: catch에서 오류를 숨기지 말고 console.error에 상세 기록
+    console.error('[audio-chunk-upload]', {
+      code: uploadErr?.code,
+      message: uploadErr?.message,
+      name: uploadErr?.name,
+      meetingId,
+      chunkId: normalizedChunkId,
+      storagePath,
+      blobSize: blob.size,
+      mimeType,
+    });
 
     chunkData.uploadStatus = 'failed';
     chunkData.errorMessage = errorMessage;
 
     try {
-      const chunkRef = getChunkDocRef(meetingId, chunkId);
+      const chunkRef = getChunkDocRef(meetingId, normalizedChunkId);
       await setDoc(
         chunkRef,
         {
@@ -180,54 +215,111 @@ export async function retryFailedChunkUpload(
 ): Promise<AudioChunk> {
   logger.info('retryFailedChunkUpload called', { meetingId, chunkId });
 
-  // 1. IndexedDB에서 저장된 청크 Blob 조회
-  const blob = await get5MinChunkBlob(meetingId, chunkId);
+  // 1. IndexedDB에서 저장된 청크 Blob 조회 (4자리 및 3자리 ID fallback)
+  let blob = await get5MinChunkBlob(meetingId, chunkId);
+  let effectiveChunkId = chunkId;
+
   if (!blob) {
-    throw new Error('로컬 임시 저장소에서 청크 오디오 데이터를 찾을 수 없습니다.');
+    // 3자리 <-> 4자리 변환 시도
+    const num = parseInt(chunkId.replace(/\D/g, ''), 10) || 1;
+    const altChunkId4 = `chunk_${String(num).padStart(4, '0')}`;
+    const altChunkId3 = `chunk_${String(num).padStart(3, '0')}`;
+    const fallbackId = chunkId === altChunkId4 ? altChunkId3 : altChunkId4;
+    blob = await get5MinChunkBlob(meetingId, fallbackId);
+    if (blob) {
+      effectiveChunkId = fallbackId;
+    }
+  }
+
+  if (!blob || blob.size === 0) {
+    const notFoundErr = new Error('로컬 임시 저장소에서 청크 오디오 데이터(Blob)를 찾을 수 없습니다.');
+    (notFoundErr as any).code = 'storage/blob-not-found';
+    console.error('[audio-chunk-upload]', {
+      code: 'storage/blob-not-found',
+      message: notFoundErr.message,
+      meetingId,
+      chunkId,
+    });
+    throw notFoundErr;
   }
 
   const chunkRef = getChunkDocRef(meetingId, chunkId);
-  await updateDoc(chunkRef, { uploadStatus: 'uploading', errorMessage: null });
+  try {
+    await updateDoc(chunkRef, { uploadStatus: 'uploading', errorMessage: null });
+  } catch {
+    // 무시
+  }
 
   // 2. 재업로드 수행
   const mimeType = blob.type || 'audio/webm';
-  const { downloadUrl, storagePath } = await uploadAudioChunkToStorage(
-    meetingId,
-    chunkId,
-    blob,
-    mimeType
-  );
+  try {
+    const { downloadUrl, storagePath } = await uploadAudioChunkToStorage(
+      meetingId,
+      chunkId,
+      blob,
+      mimeType
+    );
 
-  await setDoc(
-    chunkRef,
-    {
-      uploadStatus: 'uploaded',
-      downloadUrl,
+    await setDoc(
+      chunkRef,
+      {
+        uploadStatus: 'uploaded',
+        downloadUrl,
+        storagePath,
+        errorMessage: null,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+
+    await mark5MinChunkUploaded(meetingId, effectiveChunkId);
+    logger.info('retryFailedChunkUpload succeeded', { chunkId, storagePath });
+
+    const num = parseInt(chunkId.replace(/\D/g, ''), 10) || 1;
+    return {
+      id: chunkId,
+      meetingId,
+      index: num,
       storagePath,
-      errorMessage: null,
-      updatedAt: new Date().toISOString(),
-    },
-    { merge: true }
-  );
+      downloadUrl,
+      startSeconds: (num - 1) * 300,
+      endSeconds: num * 300,
+      duration: 300,
+      durationSeconds: 300,
+      size: blob.size,
+      fileSizeBytes: blob.size,
+      mimeType,
+      uploadStatus: 'uploaded',
+      transcriptionStatus: 'pending',
+      transcriptionAttempts: 0,
+      createdAt: new Date().toISOString(),
+    };
+  } catch (err: any) {
+    console.error('[audio-chunk-upload]', {
+      code: err?.code,
+      message: err?.message,
+      name: err?.name,
+      meetingId,
+      chunkId,
+      blobSize: blob.size,
+      mimeType,
+    });
 
-  await mark5MinChunkUploaded(meetingId, chunkId);
-
-  return {
-    id: chunkId,
-    meetingId,
-    index: parseInt(chunkId.replace(/^chunk_/i, ''), 10) || 1,
-    storagePath,
-    downloadUrl,
-    startSeconds: 0,
-    endSeconds: 300,
-    duration: 300,
-    size: blob.size,
-    mimeType,
-    uploadStatus: 'uploaded',
-    transcriptionStatus: 'pending',
-    transcriptionAttempts: 0,
-    createdAt: new Date().toISOString(),
-  };
+    try {
+      await setDoc(
+        chunkRef,
+        {
+          uploadStatus: 'failed',
+          errorMessage: err?.message || '저장 재시도 실패',
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    } catch {
+      // 무시
+    }
+    throw err;
+  }
 }
 
 export const retryFailedAudioChunk = retryFailedChunkUpload;

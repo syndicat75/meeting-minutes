@@ -15,7 +15,7 @@ import {
   Auth,
 } from 'firebase/auth';
 import { getFirestore, Firestore, doc, getDoc } from 'firebase/firestore';
-import { getStorage, FirebaseStorage } from 'firebase/storage';
+import { getStorage, FirebaseStorage, ref, getDownloadURL } from 'firebase/storage';
 import { getFirebaseConfig } from '../config/appConfig';
 import { AppUser, FirebaseConnectionStatus, AuthErrorInfo } from '../types/auth';
 import { logger } from '../utils/logger';
@@ -162,7 +162,9 @@ export function initFirebase(): FirebaseConnectionStatus {
 
     authInstance = getAuth(appInstance);
     firestoreInstance = getFirestore(appInstance);
-    storageInstance = getStorage(appInstance);
+    // storageBucket 명시 바인딩 (gs:// 접두사 포함 또는 프로젝트 기본값)
+    const bucketParam = config.storageBucket ? `gs://${config.storageBucket}` : undefined;
+    storageInstance = bucketParam ? getStorage(appInstance, bucketParam) : getStorage(appInstance);
 
     const isAuthed = Boolean(authInstance?.currentUser);
 
@@ -230,6 +232,48 @@ export async function testFirestoreConnection(): Promise<{ success: boolean; mes
     return {
       success: false,
       message: `서버 통신 실패 (${err?.code || '오류'}): ${err?.message || '네트워크 확인 필요'}`,
+    };
+  }
+}
+
+/**
+ * 실제 Firebase Storage 접근성 검증 (Health Check)
+ * 프로젝트에 Storage 버킷이 활성화되어 있는지 확인
+ */
+export async function testStorageConnection(): Promise<{ success: boolean; message: string }> {
+  logger.info('testStorageConnection called');
+  const storage = getFirebaseStorageInstance();
+  if (!storage) {
+    return { success: false, message: 'Firebase Storage 설정이 등록되지 않았습니다.' };
+  }
+
+  try {
+    const testRef = ref(storage, '_connection_test/ping.txt');
+    await getDownloadURL(testRef).catch((err: any) => {
+      // 404 (object-not-found)는 버킷 자체는 정상 존재함을 의미
+      if (err?.code === 'storage/object-not-found') {
+        return 'exists';
+      }
+      // 403 (unauthorized)도 버킷은 존재하나 보안 규칙에 의해 거절됨을 의미
+      if (err?.code === 'storage/unauthorized') {
+        return 'unauthorized';
+      }
+      throw err;
+    });
+
+    logger.info('Storage connection verified');
+    return { success: true, message: 'Firebase Storage 버킷이 정상 활성화되어 있습니다.' };
+  } catch (err: any) {
+    logger.warn('Storage test connection failed', { error: err?.message, code: err?.code });
+    if (err?.code === 'storage/bucket-not-found' || err?.code === 'storage/project-not-found') {
+      return {
+        success: false,
+        message: 'Firebase Storage 버킷을 찾을 수 없습니다. Firebase 콘솔에서 Storage 생성을 완료해주세요.',
+      };
+    }
+    return {
+      success: false,
+      message: `Storage 연결 확인 실패 (${err?.code || '오류'}): ${err?.message || '버킷 설정 확인 필요'}`,
     };
   }
 }

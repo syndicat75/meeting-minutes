@@ -11,7 +11,7 @@ import {
   deleteObject,
   UploadTaskSnapshot,
 } from 'firebase/storage';
-import { getFirebaseStorageInstance } from './firebase';
+import { getFirebaseStorageInstance, getFirebaseAuth } from './firebase';
 import { logger } from '../utils/logger';
 
 export interface UploadProgressCallback {
@@ -170,30 +170,92 @@ export async function uploadAudioChunkToStorage(
   mimeType: string,
   onProgress?: UploadProgressCallback
 ): Promise<{ storagePath: string; downloadUrl: string }> {
-  logger.info('uploadAudioChunkToStorage called', { meetingId, chunkId, byteLength: chunkBlob.size });
+  logger.info('uploadAudioChunkToStorage called', { meetingId, chunkId, byteLength: chunkBlob?.size });
+
+  // 1. meetingId 유효성 엄격 검증
+  if (!meetingId || meetingId === 'undefined' || meetingId === 'null' || meetingId.trim() === '') {
+    const meetingIdErr = new Error('올바르지 않은 회의 식별자(meetingId)입니다.');
+    (meetingIdErr as any).code = 'storage/invalid-meeting-id';
+    console.error('[audio-chunk-upload]', {
+      code: 'storage/invalid-meeting-id',
+      message: meetingIdErr.message,
+      name: meetingIdErr.name,
+      meetingId,
+      chunkId,
+    });
+    throw meetingIdErr;
+  }
+
+  // 2. WebM Blob 유효성 검증 (크기 0 검사)
+  if (!chunkBlob || chunkBlob.size === 0) {
+    const zeroSizeErr = new Error('오디오 청크 데이터가 비어 있습니다 (0 bytes). 다시 녹음해주세요.');
+    (zeroSizeErr as any).code = 'storage/empty-blob';
+    console.error('[audio-chunk-upload]', {
+      code: 'storage/empty-blob',
+      message: zeroSizeErr.message,
+      name: zeroSizeErr.name,
+      meetingId,
+      chunkId,
+      blobSize: chunkBlob ? chunkBlob.size : 0,
+    });
+    throw zeroSizeErr;
+  }
+
+  // 3. Firebase 로그인 사용자 확인
+  const auth = getFirebaseAuth();
+  const currentUser = auth?.currentUser;
+  if (!currentUser) {
+    const noUserErr = new Error('로그인 상태를 확인해주세요. (인증된 사용자만 Storage에 업로드할 수 있습니다.)');
+    (noUserErr as any).code = 'storage/unauthorized-no-user';
+    console.error('[audio-chunk-upload]', {
+      code: 'storage/unauthorized-no-user',
+      message: noUserErr.message,
+      name: noUserErr.name,
+      meetingId,
+      chunkId,
+    });
+    throw noUserErr;
+  }
 
   const storage = getFirebaseStorageInstance();
+
+  // 4. 정렬 가능한 4자리 파일명 강제 (예: chunk_0001.webm)
+  const chunkNumberMatch = chunkId.match(/\d+/);
+  const chunkIndex = chunkNumberMatch ? parseInt(chunkNumberMatch[0], 10) : 1;
+  const normalizedChunkId = `chunk_${String(chunkIndex).padStart(4, '0')}`;
+
   const extension = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('m4a') ? 'm4a' : 'webm';
-  const fileName = `${chunkId}.${extension}`;
+  const fileName = `${normalizedChunkId}.${extension}`;
   const storagePath = `meetings/${meetingId}/audio/chunks/${fileName}`;
 
   if (!storage) {
-    logger.warn('Firebase Storage not configured, creating blob URL fallback', { chunkId });
-    const blobUrl = URL.createObjectURL(chunkBlob);
-    if (onProgress) onProgress(100, chunkBlob.size, chunkBlob.size);
-    return {
+    const noStorageErr = new Error('Firebase Storage가 활성화되지 않았거나 설정되지 않았습니다.');
+    (noStorageErr as any).code = 'storage/not-configured';
+    console.error('[audio-chunk-upload]', {
+      code: 'storage/not-configured',
+      message: noStorageErr.message,
+      name: noStorageErr.name,
+      meetingId,
+      chunkId,
       storagePath,
-      downloadUrl: blobUrl,
-    };
+    });
+    throw noStorageErr;
   }
 
   const fileRef = ref(storage, storagePath);
+
+  // 5. MIME 타입 정규화 (audio/* 규칙 보장)
+  const normalizedContentType = (mimeType && mimeType.startsWith('audio/'))
+    ? mimeType.split(';')[0].trim()
+    : 'audio/webm';
+
   const metadata = {
-    contentType: mimeType,
+    contentType: normalizedContentType,
     customMetadata: {
       meetingId,
-      chunkId,
+      chunkId: normalizedChunkId,
       uploadedAt: new Date().toISOString(),
+      uploadedByUid: currentUser.uid,
     },
   };
 
@@ -213,15 +275,32 @@ export async function uploadAudioChunkToStorage(
           }
         },
         (error) => {
-          logger.error('uploadAudioChunk attempt error', error);
+          console.error('[audio-chunk-upload]', {
+            code: (error as any)?.code,
+            message: (error as any)?.message,
+            name: (error as any)?.name,
+            meetingId,
+            chunkId: normalizedChunkId,
+            storagePath,
+            blobSize: chunkBlob.size,
+            mimeType: normalizedContentType,
+          });
           reject(error);
         },
         async () => {
           try {
             const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
-            logger.info('uploadAudioChunk attempt success', { chunkId, storagePath });
+            logger.info('uploadAudioChunk attempt success', { chunkId: normalizedChunkId, storagePath });
             resolve({ storagePath, downloadUrl });
           } catch (urlErr) {
+            console.error('[audio-chunk-upload]', {
+              code: (urlErr as any)?.code,
+              message: (urlErr as any)?.message,
+              name: (urlErr as any)?.name,
+              meetingId,
+              chunkId: normalizedChunkId,
+              storagePath,
+            });
             reject(urlErr);
           }
         }

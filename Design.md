@@ -367,6 +367,26 @@ AI 일괄 전사 요청 (동시 2개 청크 제한 워커 풀로 순차/병렬 �
 - **재시도 멱등성**: 재시도 시 이미 완료된 청크의 API 비용을 낭비하지 않고 실패한 청크만 재요청합니다.
 - **단일 파일 호환성**: 사용자가 외부에서 녹음된 단일 오디오 파일(MP3, M4A, WAV 등)을 직접 업로드하는 경우에도 기존 단일 파일 전사 파이프라인과 완벽하게 상호 호환됩니다.
 
+### 9.4. 청크 업로드 안정화 및 UI 상태 불일치 해결 내역
+1. **Firebase Storage Bucket 명시적 바인딩 및 정규화**:
+   - `firebase.ts` 초기화 시 `storageBucket` URL에 `gs://` 접두사나 슬래시(`/`)가 포함되어도 안전하도록 `normalizeStorageBucket` 헬퍼 함수를 적용하고, `getStorage(app, bucketUrl)`을 명시적으로 바인딩하여 기본 버킷 누락 오류를 방지했습니다.
+2. **Storage Rules MIME 타입 확장**:
+   - 브라우저 인코더(MediaRecorder)에 따라 WebM 컨테이너 헤더가 `application/octet-stream`으로 판별되는 환경에 대비하여 `storage.rules`의 청크 경로 검사 규칙을 `(request.resource.contentType.matches('audio/.*') || request.resource.contentType == 'application/octet-stream')`으로 확장했습니다.
+3. **`ChunkAudioRecorder.stop()` 비동기 Race Condition 해소**:
+   - 사용자가 '녹음 완료 및 저장' 버튼을 눌렀을 때, 이전에는 `stop()` 함수가 백그라운드의 마지막 청크 업로드(`onChunkReady`) 완료를 기다리지 않고 즉시 반환되어 마지막 청크가 업로드 누락되거나 Firestore 메타데이터가 미반영되는 문제가 있었습니다.
+   - `ChunkAudioRecorder.stop()` 내부에서 마지막 회전 청크의 `onChunkReady` 프로미스를 `await`하도록 구조를 변경하여 모든 청크가 완전히 저장된 후에만 녹음 종료 처리가 완료되도록 보장했습니다.
+4. **청크 식별자 4자리 패딩 표준화**:
+   - `chunk_0001.webm`, `chunk_0002.webm`과 같이 4자리(`padStart(4, '0')`) 표준을 적용하여 최대 3시간(36개 구간) 이상의 대규모 회의에서도 사전순 정렬 순서가 100% 보장되도록 개선했습니다.
+5. **UI 상태 불일치 (상단 "1개 구간 저장 완료" vs 하단 "0/1 구간 저장 완료") 해소**:
+   - 기존에는 `chunks.length > 0` 조건만으로 상단에 무조건 저장 완료로 표기하던 오류를 수정하고, 실제 Storage 업로드 상태(`uploadStatus === 'uploaded'`)를 기준으로 상단과 하단 문구를 동기화했습니다.
+   - 업로드 실패 청크가 있을 경우 상단 상태에 즉시 `녹음 저장 실패 (N/M 구간 저장 완료, X개 실패)`로 일치된 정보를 표시합니다.
+6. **녹음 종료 후 메인 타이머 00:00:00 초기화 방지**:
+   - 녹음 종료 후 `recordDuration`이 리셋되더라도 실제 녹음된 전체 시간(`totalDurationSeconds`)을 `lastRecordedDuration` 및 `meeting.recordedDurationSeconds`에 저장/보존하여, 28초 녹음 완료 후 타이머가 사라지지 않고 온전히 유지되도록 개선했습니다.
+7. **미저장 구간 존재 시 AI 전사 버튼 비활성화**:
+   - 클라우드 Storage에 업로드되지 않은 청크가 하나라도 있을 경우 AI 전사 버튼(`btn-batch-transcribe`)을 비활성화하고, 명확한 안내 툴팁과 [저장 재시도] 안내 배너를 제공합니다.
+8. **클라우드 스토리지 쓰기 권한 사전 확인**:
+   - Google 로그인이 되어 있지 않은 상태에서 녹음이 시작되어 추후 Storage 쓰기 권한 오류가 발생하는 것을 사전에 방지하기 위해, 녹음 시작 시 로그인 상태를 먼저 확인하고 안내합니다.
+
 
 
 

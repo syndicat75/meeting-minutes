@@ -380,7 +380,7 @@ export class ChunkAudioRecorder {
     if (this.currentRecorder && this.currentRecorder.state !== 'inactive') {
       await new Promise<void>((resolve) => {
         if (!this.currentRecorder) return resolve();
-        this.currentRecorder.onstop = () => {
+        this.currentRecorder.onstop = async () => {
           try {
             if (this.currentRecordedSlices.length > 0) {
               const finalChunkBlob = new Blob(this.currentRecordedSlices, { type: this.mimeType });
@@ -392,11 +392,11 @@ export class ChunkAudioRecorder {
               });
 
               if (this.callbacks.onChunkReady) {
-                this.callbacks.onChunkReady(finalChunkBlob, lastChunkIdx, lastStartSec, lastEndSec);
+                await Promise.resolve(this.callbacks.onChunkReady(finalChunkBlob, lastChunkIdx, lastStartSec, lastEndSec));
               }
             }
           } catch (err) {
-            logger.error('Error creating final chunk Blob', err);
+            logger.error('Error creating or handling final chunk Blob', err);
           }
           resolve();
         };
