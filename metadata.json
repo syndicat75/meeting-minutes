@@ -1,0 +1,11 @@
+{
+  "name": "AI 회의록 관리",
+  "description": "한국어 업무용 AI 회의록 관리 및 전자서명 웹 애플리케이션",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

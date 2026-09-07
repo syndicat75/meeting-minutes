@@ -1,0 +1,33 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // 회의 관련 저장소 규칙: meetings/{meetingId}/...
+    match /meetings/{meetingId} {
+      
+      // 녹음 파일: 최대 200MB, audio/*
+      match /recordings/{fileName} {
+        allow read: if request.auth != null;
+        allow write: if request.auth != null
+                     && request.resource.size < 200 * 1024 * 1024
+                     && request.resource.contentType.matches('audio/.*');
+      }
+
+      // 회의 사진: 최대 10MB, image/*
+      match /photos/{fileName} {
+        allow read: if request.auth != null;
+        allow write: if request.auth != null
+                     && request.resource.size < 10 * 1024 * 1024
+                     && request.resource.contentType.matches('image/.*');
+      }
+
+      // 서명 이미지: 최대 2MB, image/png
+      match /signatures/{fileName} {
+        allow read: if request.auth != null;
+        allow write: if request.auth != null
+                     && request.resource.size < 2 * 1024 * 1024
+                     && request.resource.contentType == 'image/png';
+      }
+    }
+  }
+}

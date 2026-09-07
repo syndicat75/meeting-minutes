@@ -1,0 +1,39 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 회의록 컬렉션 접근 규칙
+    match /meetings/{meetingId} {
+      // 인증된 사용자이거나 로컬 개발 모드 접근 허용
+      // 읽기: 소유자이거나 권한이 부여된 사용자 또는 로그인 사용자
+      allow read: if request.auth != null;
+
+      // 생성: 로그인된 사용자
+      allow create: if request.auth != null && request.resource.data.ownerId == request.auth.uid;
+
+      // 수정: 소유자이거나 편집 권한(editor)을 가진 사용자
+      // 단, 이미 finalized(최종 확정) 상태인 경우 소유자만 수정/해제 가능
+      allow update: if request.auth != null && (
+        resource.data.ownerId == request.auth.uid ||
+        (resource.data.permissions[request.auth.uid] == 'editor' && resource.data.status != 'finalized')
+      );
+
+      // 삭제: 오직 소유자만 가능
+      allow delete: if request.auth != null && resource.data.ownerId == request.auth.uid;
+
+      // 서브컬렉션 (스냅샷 이력, 로그 등)
+      match /{subCollection=**} {
+        allow read, write: if request.auth != null && (
+          get(/databases/$(database)/documents/meetings/$(meetingId)).data.ownerId == request.auth.uid ||
+          get(/databases/$(database)/documents/meetings/$(meetingId)).data.permissions[request.auth.uid] == 'editor'
+        );
+      }
+    }
+
+    // 사용자 프로필 컬렉션
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}

@@ -1,0 +1,81 @@
+/**
+ * @file src/index.css
+ * @description 글로벌 Tailwind 스타일 및 인쇄(A4 인쇄 전용 양식) 스타일 정의
+ */
+
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Noto Sans KR', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+    color: #1e293b;
+    background-color: #f8fafc;
+  }
+}
+
+/* 서명 캔버스 전용 터치 액션 격리 */
+.touch-none-canvas {
+  touch-action: none;
+}
+
+/* 인쇄 모드 스타일링 (A4 표준 회의록 양식) */
+@media print {
+  body {
+    background-color: #ffffff !important;
+    color: #000000 !important;
+    font-size: 11pt !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* 인쇄 시 불필요한 UI 숨김 */
+  header,
+  footer,
+  nav,
+  .no-print,
+  button,
+  .btn-print-hide {
+    display: none !important;
+  }
+
+  /* 인쇄 컨테이너 확장 */
+  .print-page-container {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 10mm !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+
+  /* 테이블 페이지 나눔 제어 */
+  table {
+    page-break-inside: auto;
+    width: 100% !important;
+    border-collapse: collapse !important;
+  }
+
+  tr {
+    page-break-inside: avoid;
+    page-break-after: auto;
+  }
+
+  thead {
+    display: table-header-group;
+  }
+
+  tfoot {
+    display: table-footer-group;
+  }
+
+  /* 사진 및 서명 분할 방지 */
+  .avoid-break {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+
+  .page-break-before {
+    page-break-before: always !important;
+    break-before: page !important;
+  }
+}

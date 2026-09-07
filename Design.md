@@ -1,0 +1,129 @@
+# AI 회의록 관리 시스템 (AI Meeting Minutes Management System)
+
+## 1. 개요 및 설계 철학
+본 시스템은 산업안전보건법 및 위험성평가 위원회, 노사협의회 등 기업 및 공공기관의 공식 회의 운영 지침을 준수하는 엔터프라이즈급 **AI 회의록 관리 및 전자서명 웹 애플리케이션**입니다.
+
+단순한 화면 시연에 그치지 않고, **Firebase 클라우드 인프라(Auth, Firestore, Storage)**와 **Gemini 2.5 Flash API**를 결합하여 실제 현장에서 녹음, 전사, 요약, 사진 첨부, 전자서명 및 최종 확정본의 A4 규격 출력/PDF 저장이 가능하도록 구현되었습니다.
+
+---
+
+## 2. 시스템 아키텍처 (System Architecture)
+
+```
+[ 클라이언트 (React + Vite + Tailwind CSS) ]
+  ├── 1. 기본정보 탭 (BasicInfoTab): 회의 개요 및 메타데이터, 접근 권한 관리
+  ├── 2. 녹음/오디오 탭 (RecordingTab): 실시간 마이크 녹음, 볼륨 미터, IndexedDB 청크 백업, 음성 업로드
+  ├── 3. 대화록 탭 (TranscriptTab): 화자 매핑, 타임스탬프 이동 재생, 발언 편집, 화자 병합, 확인 필요 토글
+  ├── 4. 요약/본문표 탭 (SummaryTab): 핵심요약, 결정사항, 후속조치, '구분/내용' 표 편집, AI 재생성 비교
+  ├── 5. 사진 첨부 탭 (PhotosTab): 현장 촬영, HTML5 Canvas EXIF 제거 및 최적화 압축, 90도 회전
+  ├── 6. 참석자/서명 탭 (AttendeesTab): 10인 이상 명단, Pointer Events 캔버스 서명, 공용 태블릿 대면 서명 모드
+  └── 7. 최종확정/인쇄 탭 (FinalizePrintTab): 사전 누락 체크리스트, 스냅샷 동결, A4 세로/가로 인쇄 양식
+          │
+          ├── [ Firebase 클라이언트 SDK ] ──> Google 로그인, Firestore 실시간 동기화, Storage 안전 업로드
+          │
+          └── [ Express API 서버 (/api/ai/*) ] ──> Gemini 2.5 Flash (서버측 API Key 격리)
+```
+
+---
+
+## 3. 디렉터리 및 파일 분리 구조
+
+```
+/
+├── server.ts                       # Express 백엔드 서버 (Gemini API 프록시 및 Vite 미들웨어)
+├── firestore.rules                 # Firestore 보안 규칙 (소유자/참석자 인가 및 확정본 위변조 방지)
+├── storage.rules                   # Storage 보안 규칙 (오디오, 사진, 서명 경로 및 용량 검증)
+├── firebase.json                   # Firebase 호스팅 및 에뮬레이터 설정
+├── Design.md                       # 본 앱 구조 및 아키텍처 설계 문서
+├── src/
+│   ├── config/
+│   │   └── appConfig.ts            # 모델명(gemini-2.5-flash), API 키, 스토리지 키 중앙 집중 설정
+│   ├── types/
+│   │   ├── meeting.ts              # 회의, 참석자, 대화록, 요약, 서명, 사진 TypeScript 인터페이스
+│   │   └── auth.ts                 # 사용자 인증 및 Firebase 연결 상태 인터페이스
+│   ├── utils/
+│   │   ├── logger.ts               # 민감 정보(토큰, 서명, 녹음) 필터링 보안 로거
+│   │   └── formatters.ts           # 일자, 시각, 파일크기, 오디오 재생시간 한국어 포맷터
+│   ├── services/
+│   │   ├── firebase.ts             # Firebase 앱, Auth, Firestore, Storage 클라이언트 초기화
+│   │   ├── meetingService.ts       # 회의 CRUD 및 Firestore/로컬 폴백 동기화 엔진
+│   │   ├── audioRecorder.ts        # 브라우저 Web Audio API 및 MediaRecorder 녹음 엔진
+│   │   ├── indexedDbAudio.ts       # 녹음 중 새로고침/이탈 대비 IndexedDB 청크 임시 보존
+│   │   ├── storageService.ts       # 오디오/사진(Canvas EXIF 제거)/서명 PNG 업로드
+│   │   └── aiService.ts            # 백엔드 Gemini 전사 및 요약 REST API 클라이언트
+│   ├── components/
+│   │   ├── common/
+│   │   │   ├── Header.tsx          # 상단 헤더, 로고, Firebase 상태 배지, Google 로그인
+│   │   │   ├── Footer.tsx          # 하단 푸터, 법적 규정 고지, 상단 이동 플로팅 버튼
+│   │   │   ├── FirebaseConfigModal.tsx # Firebase 연결 상태 진단 및 직접 설정 입력 가이드 모달
+│   │   │   └── ConfirmModal.tsx    # 삭제 및 최종 확정 안전 확인 대화상자
+│   │   └── meeting/
+│   │       ├── MeetingCard.tsx     # 회의 목록 단일 카드 (상태, 녹음/사진/서명 현황 표시)
+│   │       ├── MeetingListView.tsx # 회의 목록 뷰 (카드/테이블 전환, 검색, 상태/사업장 필터)
+│   │       ├── MeetingDetailView.tsx # 회의 상세 뷰 컨테이너 (6대 탭 전환 및 상단 네비게이션)
+│   │       ├── SignatureModal.tsx  # 전자서명 모달 (터치/마우스/펜, 공용 태블릿 연속 서명 지원)
+│   │       └── tabs/
+│   │           ├── BasicInfoTab.tsx    # 1. 기본 정보 탭 (일자, 장소, 안건, 권한 공유)
+│   │           ├── RecordingTab.tsx    # 2. 녹음 및 오디오 탭 (볼륨 미터, 동의 확인, 파일 업로드)
+│   │           ├── TranscriptTab.tsx   # 3. 화자별 대화록 탭 (화자 매핑, 타임스탬프 재생, TXT 다운)
+│   │           ├── SummaryTab.tsx      # 4. 요약 및 회의내용 탭 (구분/내용 표, 후속조치, 재생성 비교)
+│   │           ├── PhotosTab.tsx       # 5. 회의 사진 탭 (현장 촬영, 회전, 순서 변경, 캡션)
+│   │           ├── AttendeesTab.tsx    # 6. 참석자 및 서명 탭 (10인 이상, 직책별 관리, 전자서명)
+│   │           └── FinalizePrintTab.tsx # 7. 최종 확정 및 인쇄 탭 (체크리스트, 스냅샷, A4 인쇄)
+│   ├── App.tsx                     # 메인 애플리케이션 상태 및 화면 라우팅
+│   ├── main.tsx                    # React DOM 진입점
+│   └── index.css                   # 글로벌 Tailwind 스타일 및 A4 @media print 양식 규칙
+```
+
+---
+
+## 4. 데이터 흐름 및 상태 머신 (Data Flow)
+
+1. **회의 생성 및 템플릿 복사**:
+   - `draft` (작성 중) 상태로 초기화. 기본 10인 표준 참석자 명단 자동 세팅.
+   - 기존 회의 복사 시 이전 녹음, 사진, 서명을 제외한 양식과 참석자만 안전하게 복제.
+2. **녹음 및 동의 고지**:
+   - 참석자 사전 동의 체크 후 브라우저 마이크 녹음 시작.
+   - 1초 단위로 음성 청크를 `IndexedDB`에 안전하게 버퍼링하여 네트워크 단절이나 브라우저 새로고침 시 복구 지원.
+3. **AI 화자 분리 전사 (STT)**:
+   - 서버 측에서 Gemini 2.5 Flash를 통해 오디오 파일을 분석하여 `TranscriptSegment` 배열 도출.
+   - 클라이언트에서 화자(예: 화자 1, 화자 2)를 실제 등록된 참석자 이름과 1:1 매핑.
+4. **AI 요약 및 '구분 / 내용' 본문 표 도출**:
+   - 대화록을 근거로 표준 회의록 본문 문안, 핵심 요약, 결정 사항, 미결 사항, 후속 조치(Action Items) 도출.
+   - 사용자가 이미 수정한 내용이 존재할 경우 임의로 덮어쓰지 않고 비교 모달을 통해 선택 반영.
+5. **현장 사진 및 증빙 자료 등록**:
+   - 카메라 직접 촬영 및 파일 선택 지원.
+   - HTML5 Canvas를 이용해 위치/기기 정보가 담긴 EXIF를 자동 제거하고 1600px 리사이즈 및 용량 최적화.
+6. **참석자 전자서명**:
+   - Pointer Events 기반 캔버스에서 마우스/스마트폰 터치/스타일러스 펜 지원.
+   - 회의 현장에서 1대의 태블릿으로 참석자 전원이 순차 서명할 수 있는 '공용 태블릿 연속 대면 서명 모드' 제공.
+7. **최종 확정 및 인쇄/PDF 저장**:
+   - 필수 메타데이터, 내용 작성 여부, 전원 서명 여부를 사전 체크리스트로 검증.
+   - 소유자가 최종 확정(`finalized`) 시 회의 전체 상태를 `snapshotData`로 동결하여 이후 수정 불가(Read-Only) 처리.
+   - 브라우저 인쇄 대화상자를 호출하여 A4 세로 또는 가로 규격으로 완벽한 표준 양식 출력.
+
+---
+
+## 5. 보안 및 컴플라이언스 (Security & Compliance)
+
+- **API 키 은닉**: Gemini API Key 및 백엔드 시크릿은 브라우저로 노출되지 않고 `server.ts`의 Express 엔드포인트를 통해서만 호출.
+- **로깅 보안 준수**: `logger.ts`에서 음성 바이너리, 서명 이미지 데이터 URL, 사용자 비밀번호 및 토큰을 자동으로 마스킹하여 콘솔에 PII(개인식별정보)가 남지 않도록 설계.
+- **Firestore 접근 제어**:
+  - 생성자(`ownerId`) 및 명시적으로 권한을 부여받은 사용자(`permissions`)만 문서 읽기/쓰기 허용.
+  - `status == 'finalized'` 상태인 경우 문서 임의 변조 방지.
+- **Storage 저장소 규칙**:
+  - 회의 참여자만 해당 회의 경로(`meetings/{meetingId}/*`)에 파일을 업로드할 수 있도록 제한.
+  - 업로드 파일의 MIME 타입(`image/*`, `audio/*`) 및 최대 용량 한도(사진 10MB, 오디오 200MB) 서버 측 검증.
+
+---
+
+## 6. Firebase 외부 계정 설정 가이드
+
+본 앱은 Firebase가 설정되지 않은 로컬 환경에서도 `IndexedDB` 및 `localStorage` 기반 로컬 안전 모드로 모든 기능(녹음, 재생, 대화록, 사진, 서명, 인쇄)을 완전하게 테스트할 수 있습니다. 실제 프로덕션 클라우드 동기화를 위한 절차는 다음과 같습니다:
+
+1. **Firebase 콘솔 (https://console.firebase.google.com) 접속 및 프로젝트 생성**
+2. **Authentication 활성화**: Sign-in method에서 'Google' 제공업체 사용 설정.
+3. **Cloud Firestore 활성화**: 프로덕션 모드로 데이터베이스 생성 후 제공된 `firestore.rules` 배포.
+4. **Firebase Storage 활성화**: 기본 버킷 생성 후 제공된 `storage.rules` 배포.
+5. **웹 앱 등록 및 구성값 적용**:
+   - Firebase 콘솔의 웹 앱 설정에서 발급받은 구성값(`apiKey`, `projectId`, `storageBucket` 등)을 앱 우측 상단의 [Firebase 설정] 모달의 '직접 설정 입력' 탭에 저장하거나 환경 변수에 등록합니다.
