@@ -155,6 +155,99 @@ export async function uploadRecordingAudio(
 }
 
 /**
+ * 5분 단위 오디오 Chunk를 Firebase Storage에 직접 업로드 (지수 백오프 자동 재시도)
+ * @param meetingId 회의 ID
+ * @param chunkId 청크 식별자 (예: chunk_0001)
+ * @param chunkBlob 오디오 청크 Blob
+ * @param mimeType 오디오 MIME 타입
+ * @param onProgress 진행률 콜백 (선택)
+ * @returns {Promise<{ storagePath: string; downloadUrl: string }>}
+ */
+export async function uploadAudioChunkToStorage(
+  meetingId: string,
+  chunkId: string,
+  chunkBlob: Blob,
+  mimeType: string,
+  onProgress?: UploadProgressCallback
+): Promise<{ storagePath: string; downloadUrl: string }> {
+  logger.info('uploadAudioChunkToStorage called', { meetingId, chunkId, byteLength: chunkBlob.size });
+
+  const storage = getFirebaseStorageInstance();
+  const extension = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('m4a') ? 'm4a' : 'webm';
+  const fileName = `${chunkId}.${extension}`;
+  const storagePath = `meetings/${meetingId}/audio/chunks/${fileName}`;
+
+  if (!storage) {
+    logger.warn('Firebase Storage not configured, creating blob URL fallback', { chunkId });
+    const blobUrl = URL.createObjectURL(chunkBlob);
+    if (onProgress) onProgress(100, chunkBlob.size, chunkBlob.size);
+    return {
+      storagePath,
+      downloadUrl: blobUrl,
+    };
+  }
+
+  const fileRef = ref(storage, storagePath);
+  const metadata = {
+    contentType: mimeType,
+    customMetadata: {
+      meetingId,
+      chunkId,
+      uploadedAt: new Date().toISOString(),
+    },
+  };
+
+  // 지수 백오프 재시도 (최대 3회: 2초, 5초, 10초)
+  const retryDelays = [2000, 5000, 10000];
+
+  const attemptUpload = async (): Promise<{ storagePath: string; downloadUrl: string }> => {
+    return new Promise((resolve, reject) => {
+      const uploadTask = uploadBytesResumable(fileRef, chunkBlob, metadata);
+
+      uploadTask.on(
+        'state_changed',
+        (snapshot: UploadTaskSnapshot) => {
+          const percent = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
+          if (onProgress) {
+            onProgress(percent, snapshot.bytesTransferred, snapshot.totalBytes);
+          }
+        },
+        (error) => {
+          logger.error('uploadAudioChunk attempt error', error);
+          reject(error);
+        },
+        async () => {
+          try {
+            const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
+            logger.info('uploadAudioChunk attempt success', { chunkId, storagePath });
+            resolve({ storagePath, downloadUrl });
+          } catch (urlErr) {
+            reject(urlErr);
+          }
+        }
+      );
+    });
+  };
+
+  let lastError: any = null;
+  for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+    try {
+      if (attempt > 0) {
+        const delay = retryDelays[attempt - 1];
+        logger.warn(`Retrying chunk upload (attempt ${attempt}/${retryDelays.length}) after ${delay}ms`, { chunkId });
+        await new Promise((r) => setTimeout(r, delay));
+      }
+      return await attemptUpload();
+    } catch (err) {
+      lastError = err;
+      logger.error(`Chunk upload attempt ${attempt + 1} failed`, err);
+    }
+  }
+
+  throw lastError;
+}
+
+/**
  * 회의 개최 사진 업로드
  * @param meetingId 회의 ID
  * @param photoFile 원본 사진 파일

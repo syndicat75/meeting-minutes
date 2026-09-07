@@ -222,14 +222,18 @@ export function isValidMeetingStoragePath(meetingId: string, storagePath: string
     return false;
   }
 
-  // meetings/{meetingId}/recordings/ 하위 경로인지 확인
-  const expectedPrefix = `meetings/${meetingId}/recordings/`;
-  if (!storagePath.startsWith(expectedPrefix)) {
-    console.warn('[AUTH] Storage path prefix mismatch', { storagePath, expectedPrefix });
+  // meetings/{meetingId}/audio/ 또는 meetings/{meetingId}/recordings/ 하위 경로인지 확인
+  const isAudioPath = storagePath.startsWith(`meetings/${meetingId}/audio/`);
+  const isRecordingsPath = storagePath.startsWith(`meetings/${meetingId}/recordings/`);
+
+  if (!isAudioPath && !isRecordingsPath) {
+    console.warn('[AUTH] Storage path prefix mismatch', { storagePath, meetingId });
     return false;
   }
 
-  const fileName = storagePath.slice(expectedPrefix.length);
+  // 허용되는 오디오 확장자 확인 (.webm, .mp4, .m4a, .wav, .mp3, .ogg)
+  const segments = storagePath.split('/');
+  const fileName = segments[segments.length - 1];
   if (!fileName || !SERVER_CONFIG.allowedAudioExtensionsRegex.test(fileName)) {
     console.warn('[AUTH] Storage path file extension invalid', { fileName });
     return false;

@@ -18,6 +18,9 @@ export const SERVER_CONFIG = {
   // OpenAI 전사 모델 (공식 화자 분리 Diarization 지원 모델)
   openaiTranscribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe-diarize',
 
+  // OpenAI 회의 요약 모델 (회의 요약, 결정사항, 액션아이템 추출용)
+  openaiSummaryModel: process.env.OPENAI_SUMMARY_MODEL || 'gpt-4o-mini',
+
   // Gemini AI 모델 (Gemini 3.6 Flash: 최신 안정 모델, GEMINI_MODEL 환경변수로 재지정 가능)
   geminiModel: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
 
@@ -66,6 +69,7 @@ export const SERVER_CONFIG = {
 export function getServerEnv(): {
   openaiApiKey: string | undefined;
   openaiTranscribeModel: string;
+  openaiSummaryModel: string;
   primaryProvider: string;
   fallbackProvider: string;
   geminiApiKey: string | undefined;
@@ -78,6 +82,7 @@ export function getServerEnv(): {
   return {
     openaiApiKey: process.env.OPENAI_API_KEY,
     openaiTranscribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || SERVER_CONFIG.openaiTranscribeModel,
+    openaiSummaryModel: process.env.OPENAI_SUMMARY_MODEL || SERVER_CONFIG.openaiSummaryModel,
     primaryProvider: process.env.AI_PRIMARY_PROVIDER || SERVER_CONFIG.primaryProvider,
     fallbackProvider: process.env.AI_FALLBACK_PROVIDER || SERVER_CONFIG.fallbackProvider,
     geminiApiKey: process.env.GEMINI_API_KEY,

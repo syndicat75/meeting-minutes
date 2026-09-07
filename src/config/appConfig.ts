@@ -107,8 +107,16 @@ export const APP_CONFIG = {
   },
 
   limits: {
-    // 회의당 최대 녹음 시간: 120분 (초 단위)
-    maxRecordingDurationSeconds: 120 * 60,
+    // 회의당 최대 권장 녹음 시간: 180분 (3시간, 초 단위: 10800초)
+    maxRecordingDurationSeconds: 180 * 60,
+    // 5분 단위 오디오 Chunk 생성 시간 (기본 300,000ms = 5분, 환경변수로 손쉽게 조정 가능)
+    chunkDurationMs: Number((import.meta as any)?.env?.VITE_AUDIO_CHUNK_DURATION_MS) || 5 * 60 * 1000,
+    // 최대 Chunk 개수 (180분 / 5분 = 36개)
+    maxChunksCount: 36,
+    // Chunk 업로드 실패 시 지수 백오프 재시도 대기 시간 (1차: 2초, 2차: 5초, 3차: 10초)
+    uploadRetryDelaysMs: [2000, 5000, 10000],
+    // 동시 전사 병렬 처리 제한 (API Rate Limit 및 브라우저/서버 부하 방지용 최대 동시 2개)
+    maxConcurrentTranscriptions: 2,
     // 파일 업로드 용량 제한: 200MB (바이트 단위)
     maxRecordingFileSizeBytes: 200 * 1024 * 1024,
     // 회의 사진 최대 용량: 15MB (바이트 단위)

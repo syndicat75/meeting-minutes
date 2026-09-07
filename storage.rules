@@ -5,8 +5,16 @@ service firebase.storage {
     // 회의 관련 저장소 규칙: meetings/{meetingId}/...
     match /meetings/{meetingId} {
       
-      // 녹음 파일: 최대 200MB, audio/*
+      // 녹음 파일: 최대 200MB, audio/* (단일 녹음 및 5분 분할 Chunk)
       match /recordings/{fileName} {
+        allow read: if request.auth != null;
+        allow write: if request.auth != null
+                     && request.resource.size < 200 * 1024 * 1024
+                     && request.resource.contentType.matches('audio/.*');
+      }
+
+      // 오디오 청크 분할 저장소: meetings/{meetingId}/audio/chunks/chunk_0001.webm 등
+      match /audio/{allPaths=**} {
         allow read: if request.auth != null;
         allow write: if request.auth != null
                      && request.resource.size < 200 * 1024 * 1024

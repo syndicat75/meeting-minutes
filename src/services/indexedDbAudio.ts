@@ -7,9 +7,22 @@
 import { logger } from '../utils/logger';
 
 const DB_NAME = 'AiMeetingAudioStorage';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_CHUNKS = 'audio_chunks';
 const STORE_METADATA = 'recording_sessions';
+const STORE_5MIN_CHUNKS = 'audio_5min_chunks';
+
+export interface Stored5MinChunk {
+  meetingId: string;
+  chunkId: string;
+  index: number;
+  blob: Blob;
+  mimeType: string;
+  startSeconds: number;
+  endSeconds: number;
+  createdAt: string;
+  isUploaded: boolean;
+}
 
 export interface StoredAudioSession {
   meetingId: string;
@@ -45,6 +58,9 @@ export function openAudioDatabase(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_METADATA)) {
         db.createObjectStore(STORE_METADATA, { keyPath: 'meetingId' });
+      }
+      if (!db.objectStoreNames.contains(STORE_5MIN_CHUNKS)) {
+        db.createObjectStore(STORE_5MIN_CHUNKS, { keyPath: ['meetingId', 'chunkId'] });
       }
     };
 
@@ -244,3 +260,146 @@ export async function removeAudioSession(meetingId: string): Promise<void> {
     };
   });
 }
+
+/**
+ * 5분 단위 오디오 청크 Blob을 IndexedDB에 안전하게 저장 (브라우저 크래시 복구용)
+ * @param meetingId 회의 ID
+ * @param chunkId 청크 ID (예: chunk_0001)
+ * @param index 순번 (1부터 시작)
+ * @param blob 청크 오디오 Blob
+ * @param mimeType 오디오 MIME 타입
+ * @param startSeconds 시작 초
+ * @param endSeconds 종료 초
+ */
+export async function save5MinChunkBlob(
+  meetingId: string,
+  chunkId: string,
+  index: number,
+  blob: Blob,
+  mimeType: string,
+  startSeconds: number,
+  endSeconds: number
+): Promise<void> {
+  logger.info('save5MinChunkBlob called', { meetingId, chunkId, index, sizeBytes: blob.size });
+  const db = await openAudioDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_5MIN_CHUNKS], 'readwrite');
+    const store = tx.objectStore(STORE_5MIN_CHUNKS);
+    const item: Stored5MinChunk = {
+      meetingId,
+      chunkId,
+      index,
+      blob,
+      mimeType,
+      startSeconds,
+      endSeconds,
+      createdAt: new Date().toISOString(),
+      isUploaded: false,
+    };
+    const req = store.put(item);
+    req.onsuccess = () => resolve();
+    req.onerror = () => {
+      logger.error('save5MinChunkBlob failed', req.error);
+      reject(req.error);
+    };
+  });
+}
+
+/**
+ * 특정 5분 오디오 청크 Blob 조회
+ * @param meetingId 회의 ID
+ * @param chunkId 청크 ID
+ * @returns {Promise<Blob | null>}
+ */
+export async function get5MinChunkBlob(meetingId: string, chunkId: string): Promise<Blob | null> {
+  logger.info('get5MinChunkBlob called', { meetingId, chunkId });
+  const db = await openAudioDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_5MIN_CHUNKS], 'readonly');
+    const store = tx.objectStore(STORE_5MIN_CHUNKS);
+    const req = store.get([meetingId, chunkId]);
+    req.onsuccess = () => {
+      const result = req.result as Stored5MinChunk | undefined;
+      resolve(result?.blob || null);
+    };
+    req.onerror = () => {
+      logger.error('get5MinChunkBlob failed', req.error);
+      reject(req.error);
+    };
+  });
+}
+
+/**
+ * 특정 회의의 모든 5분 청크 데이터 조회 (복구용)
+ * @param meetingId 회의 ID
+ * @returns {Promise<Stored5MinChunk[]>}
+ */
+export async function getAll5MinChunks(meetingId: string): Promise<Stored5MinChunk[]> {
+  logger.info('getAll5MinChunks called', { meetingId });
+  const db = await openAudioDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_5MIN_CHUNKS], 'readonly');
+    const store = tx.objectStore(STORE_5MIN_CHUNKS);
+    const req = store.getAll();
+    req.onsuccess = () => {
+      const all = (req.result || []) as Stored5MinChunk[];
+      const meetingChunks = all
+        .filter((c) => c.meetingId === meetingId)
+        .sort((a, b) => a.index - b.index);
+      resolve(meetingChunks);
+    };
+    req.onerror = () => {
+      logger.error('getAll5MinChunks failed', req.error);
+      reject(req.error);
+    };
+  });
+}
+
+/**
+ * 5분 청크 업로드 완료 상태 갱신
+ * @param meetingId 회의 ID
+ * @param chunkId 청크 ID
+ */
+export async function mark5MinChunkUploaded(meetingId: string, chunkId: string): Promise<void> {
+  logger.debug('mark5MinChunkUploaded called', { meetingId, chunkId });
+  const db = await openAudioDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_5MIN_CHUNKS], 'readwrite');
+    const store = tx.objectStore(STORE_5MIN_CHUNKS);
+    const req = store.get([meetingId, chunkId]);
+    req.onsuccess = () => {
+      const item = req.result as Stored5MinChunk | undefined;
+      if (item) {
+        item.isUploaded = true;
+        store.put(item);
+      }
+      resolve();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * 회의 관련 5분 청크 데이터 일괄 삭제
+ * @param meetingId 회의 ID
+ */
+export async function remove5MinChunks(meetingId: string): Promise<void> {
+  logger.info('remove5MinChunks called', { meetingId });
+  const db = await openAudioDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_5MIN_CHUNKS], 'readwrite');
+    const store = tx.objectStore(STORE_5MIN_CHUNKS);
+    const req = store.getAllKeys();
+    req.onsuccess = () => {
+      const keys = req.result as Array<[string, string]>;
+      for (const key of keys) {
+        if (Array.isArray(key) && key[0] === meetingId) {
+          store.delete(key);
+        }
+      }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+

@@ -336,6 +336,8 @@ export function subscribeAuthState(callback: (user: AppUser | null) => void): ()
 
 export const subscribeAuthChanges = subscribeAuthState;
 export const loginWithGoogle = signInWithGoogle;
+export const getFirestoreInstance = getFirebaseDb;
+export const getFirebaseIdToken = getCurrentUserIdToken;
 
 /**
  * 현재 로그인된 사용자의 Firebase ID 토큰을 취득하는 헬퍼 함수

@@ -1,7 +1,11 @@
 /**
  * @file src/components/meeting/tabs/RecordingTab.tsx
- * @description 회의 실시간 음성 녹음 및 기존 오디오 파일(MP3, M4A, WAV, WebM) 업로드 탭.
- * 입력 음량 게이지, 녹음 동의 체크, Wake Lock 알림, 원본 오디오 플레이어 및 AI 전사 요청 지원.
+ * @description 장시간(최대 3시간) 업무용 회의를 위한 5분 단위 자동 Chunk 녹음 및 AI 전사 관리 탭.
+ * - 5분마다 무중단 자동 Chunk 분할 및 Firebase Storage 즉시 직업로드
+ * - 실시간 "N / N 구간 저장 완료" 상태 표시 및 구간별 업로드/전사 현황
+ * - 최대 3시간 도달 자동 안전 마무리 및 Screen Wake Lock 지원
+ * - 동시 2개 제한 청크 전사 오케스트레이션 및 부분 실패 재시도 기능
+ * - 외부 오디오 파일(MP3, M4A, WAV, WebM) 업로드 완벽 호환
  */
 
 import React, { useState, useRef, useEffect } from 'react';
@@ -19,12 +23,26 @@ import {
   FileAudio,
   ShieldCheck,
   RefreshCw,
+  Clock,
+  Layers,
+  Check,
+  RotateCcw,
 } from 'lucide-react';
-import { Meeting, RecordingMetadata } from '../../../types/meeting';
-import { BrowserAudioRecorder, RecorderState } from '../../../services/audioRecorder';
+import { Meeting, AudioChunk, RecordingMetadata } from '../../../types/meeting';
+import { ChunkAudioRecorder } from '../../../services/chunkAudioRecorder';
+import {
+  processAndUploadAudioChunk,
+  getMeetingAudioChunks,
+  retryFailedAudioChunk,
+} from '../../../services/audioChunkService';
+import {
+  transcribeAllChunks,
+  transcribeSingleChunk,
+  mergeAndDeduplicateTranscripts,
+  requestComprehensiveMeetingSummary,
+} from '../../../services/transcriptionClientService';
 import { uploadRecordingAudio } from '../../../services/storageService';
 import { removeAudioSession } from '../../../services/indexedDbAudio';
-import { requestTranscriptionDetails } from '../../../services/aiService';
 import { formatDuration, formatFileSize } from '../../../utils/formatters';
 import { APP_CONFIG } from '../../../config/appConfig';
 import { logger } from '../../../utils/logger';
@@ -37,59 +55,160 @@ interface RecordingTabProps {
 }
 
 /**
- * 녹음 및 오디오 관리 탭 컴포넌트
+ * 시간 포맷 헬퍼 (초 -> HH:MM:SS)
  */
+function formatSeconds(sec: number): string {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) {
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
 export const RecordingTab: React.FC<RecordingTabProps> = ({
   meeting,
   isReadOnly,
   onUpdateMeeting,
   onSwitchToTranscriptTab,
 }) => {
-  logger.debug('RecordingTab rendered', { meetingId: meeting.id, hasRecording: Boolean(meeting.recording) });
+  logger.debug('RecordingTab rendered', { meetingId: meeting.id });
 
-  const [recorderState, setRecorderState] = useState<RecorderState>('inactive');
+  // 녹음기 상태
+  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [isPaused, setIsPaused] = useState<boolean>(false);
   const [recordDuration, setRecordDuration] = useState<number>(0);
   const [inputVolume, setInputVolume] = useState<number>(0);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [activeChunkIndex, setActiveChunkIndex] = useState<number>(1);
 
-  // 법적 고지 및 참석자 동의 확인 체크박스
+  // 청크 목록 상태 (로컬 상태 및 meeting.audioChunks 동기화)
+  const [chunks, setChunks] = useState<AudioChunk[]>(meeting.audioChunks || []);
+
+  // UI 알림 및 에러
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [maxDurationAlert, setMaxDurationAlert] = useState<boolean>(false);
+
+  // 법적 고지 및 참석자 동의
   const [isConsentChecked, setIsConsentChecked] = useState<boolean>(
     meeting.recording?.isConsentGiven || false
   );
 
   // 업로드 진행 상태
-  const [uploadPercent, setUploadPercent] = useState<number>(0);
   const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [uploadPercent, setUploadPercent] = useState<number>(0);
 
-  // AI 전사 처리 상태
+  // 전사 진행 상태
   const [isTranscribing, setIsTranscribing] = useState<boolean>(false);
+  const [transcribeProgressLabel, setTranscribeProgressLabel] = useState<string>('');
+  const [transcribeProgressPercent, setTranscribeProgressPercent] = useState<number>(0);
   const [transcribeError, setTranscribeError] = useState<string | null>(null);
-  // 전사 직접 전송을 위한 현재 세션 오디오 Blob 보관
-  const [currentAudioBlob, setCurrentAudioBlob] = useState<Blob | null>(null);
 
-  // 녹음 인스턴스 참조
-  const recorderRef = useRef<BrowserAudioRecorder | null>(null);
+  // 요약 생성 상태
+  const [isSummarizing, setIsSummarizing] = useState<boolean>(false);
+
+  // 참조 관리
+  const recorderRef = useRef<ChunkAudioRecorder | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  const activeMeetingIdRef = useRef<string>(meeting.id);
 
-  // 컴포넌트 마운트 시 리코더 초기화
+  // 회의 변경 시 ID 참조 동기화 및 Firestore 청크 목록 로드
   useEffect(() => {
-    recorderRef.current = new BrowserAudioRecorder({
-      onStateChange: (state) => setRecorderState(state),
-      onTimeUpdate: (seconds) => setRecordDuration(seconds),
-      onVolumeUpdate: (vol) => setInputVolume(vol),
-      onError: (err) => {
-        logger.error('Recorder callback error', { err });
-        setErrorMessage(err);
-      },
-    });
+    activeMeetingIdRef.current = meeting.id;
+    if (meeting.audioChunks && meeting.audioChunks.length > 0) {
+      setChunks(meeting.audioChunks);
+    } else {
+      getMeetingAudioChunks(meeting.id)
+        .then((loaded) => {
+          if (loaded && loaded.length > 0) {
+            setChunks(loaded);
+          }
+        })
+        .catch((e) => logger.warn('Failed to load chunks from Firestore', e));
+    }
+  }, [meeting.id, meeting.audioChunks]);
 
+  // 언마운트 시 활성 녹음 정리
+  useEffect(() => {
     return () => {
-      if (recorderRef.current && recorderRef.current.getState() !== 'inactive') {
-        recorderRef.current.stop();
+      if (recorderRef.current && recorderRef.current.getIsRecording()) {
+        recorderRef.current.stop().catch(() => {});
       }
     };
   }, []);
+
+  /**
+   * 5분 단위 Chunk 생성 콜백 핸들러
+   */
+  const handleChunkReady = async (
+    blob: Blob,
+    chunkIndex: number,
+    startSeconds: number,
+    endSeconds: number
+  ) => {
+    const currentMeetingId = activeMeetingIdRef.current;
+    logger.info('handleChunkReady triggered', {
+      meetingId: currentMeetingId,
+      chunkIndex,
+      startSeconds,
+      endSeconds,
+      blobSize: blob.size,
+    });
+
+    const chunkId = `chunk_${String(chunkIndex).padStart(3, '0')}`;
+
+    // 낙관적 UI 업데이트
+    setChunks((prev) => {
+      const existing = prev.find((c) => c.id === chunkId);
+      if (existing) return prev;
+      const newChunk: AudioChunk = {
+        id: chunkId,
+        meetingId: currentMeetingId,
+        index: chunkIndex,
+        startSeconds,
+        endSeconds,
+        duration: endSeconds - startSeconds,
+        durationSeconds: endSeconds - startSeconds,
+        size: blob.size,
+        fileSizeBytes: blob.size,
+        mimeType: blob.type || 'audio/webm',
+        storagePath: `meetings/${currentMeetingId}/audio/chunks/${chunkId}.webm`,
+        uploadStatus: 'uploading',
+        transcriptionStatus: 'pending',
+        transcriptionAttempts: 0,
+        createdAt: new Date().toISOString(),
+      };
+      return [...prev, newChunk];
+    });
+
+    try {
+      const savedChunk = await processAndUploadAudioChunk(
+        currentMeetingId,
+        chunkId,
+        chunkIndex,
+        blob,
+        blob.type || 'audio/webm',
+        startSeconds,
+        endSeconds
+      );
+
+      // 성공한 청크로 로컬 상태 갱신
+      setChunks((prev) => {
+        const updated = prev.map((c) => (c.id === chunkId ? savedChunk : c));
+        onUpdateMeeting({ audioChunks: updated });
+        return updated;
+      });
+    } catch (err: any) {
+      logger.error('Failed to process and upload chunk', { chunkId, err });
+      setChunks((prev) => {
+        const updated = prev.map((c) =>
+          c.id === chunkId ? { ...c, uploadStatus: 'failed' as const, errorMessage: err.message } : c
+        );
+        onUpdateMeeting({ audioChunks: updated });
+        return updated;
+      });
+    }
+  };
 
   /**
    * 녹음 시작
@@ -102,99 +221,267 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
     }
 
     setErrorMessage(null);
-    if (recorderRef.current) {
-      await recorderRef.current.start(meeting.id);
+    setMaxDurationAlert(false);
+
+    try {
+      const recorder = new ChunkAudioRecorder({
+        onTick: (duration, volume) => {
+          setRecordDuration(duration);
+          setInputVolume(volume);
+        },
+        onChunkReady: handleChunkReady,
+        onMaxDurationReached: () => {
+          setMaxDurationAlert(true);
+          setIsRecording(false);
+        },
+        onError: (err) => {
+          setErrorMessage(err.message || '마이크 접근에 실패했습니다.');
+          setIsRecording(false);
+        },
+      });
+
+      recorderRef.current = recorder;
+      await recorder.start();
+
+      setIsRecording(true);
+      setIsPaused(false);
+      setActiveChunkIndex(1);
+      onUpdateMeeting({ recordingStatus: 'recording' });
+    } catch (err: any) {
+      logger.error('Failed to start recording', err);
+      setErrorMessage(err.message || '마이크 사용 권한을 확인해주세요.');
     }
   };
 
   /**
-   * 녹음 일시정지
+   * 일시 정지
    */
   const handlePauseRecording = () => {
     logger.info('handlePauseRecording called');
     if (recorderRef.current) {
       recorderRef.current.pause();
+      setIsPaused(true);
+      onUpdateMeeting({ recordingStatus: 'paused' });
     }
   };
 
   /**
    * 녹음 재개
    */
-  const handleResumeRecording = async () => {
+  const handleResumeRecording = () => {
     logger.info('handleResumeRecording called');
     if (recorderRef.current) {
-      await recorderRef.current.resume();
+      recorderRef.current.resume();
+      setIsPaused(false);
+      onUpdateMeeting({ recordingStatus: 'recording' });
     }
   };
 
   /**
-   * 녹음 완료 및 업로드 처리
+   * 녹음 완전히 종료 및 최종 청크 저장
    */
   const handleStopRecording = async () => {
     logger.info('handleStopRecording called');
     if (!recorderRef.current) return;
 
-    const result = await recorderRef.current.stop();
-    if (!result || !result.blob) {
-      setErrorMessage('녹음 데이터가 비어있거나 저장에 실패했습니다.');
-      return;
-    }
-
-    setIsUploading(true);
-    setUploadPercent(0);
-
     try {
-      // 녹음 직후 생성된 오디오 Blob을 세션 상태에 즉시 보관
-      setCurrentAudioBlob(result.blob);
+      const { totalDurationSeconds } = await recorderRef.current.stop();
+      setIsRecording(false);
+      setIsPaused(false);
 
-      // 1. Storage 업로드 (또는 오프라인 로컬 URL 생성)
-      const uploadRes = await uploadRecordingAudio(
-        meeting.id,
-        result.blob,
-        result.mimeType,
-        (percent) => setUploadPercent(percent)
-      );
+      const latestChunks = await getMeetingAudioChunks(meeting.id);
+      setChunks(latestChunks);
+
+      const totalBytes = latestChunks.reduce((acc, c) => acc + (c.size || c.fileSizeBytes || 0), 0);
 
       const metadata: RecordingMetadata = {
         id: 'rec_' + Date.now(),
-        storagePath: uploadRes.storagePath,
-        downloadUrl: uploadRes.downloadUrl,
-        durationSeconds: result.durationSeconds,
-        fileSizeBytes: result.blob.size,
-        mimeType: result.mimeType,
-        fileName: `녹음_${meeting.date || '회의'}.webm`,
+        storagePath: latestChunks[0]?.storagePath || '',
+        downloadUrl: latestChunks[0]?.downloadUrl,
+        durationSeconds: totalDurationSeconds,
+        fileSizeBytes: totalBytes,
+        mimeType: 'audio/webm',
+        fileName: `회의녹음_${meeting.date || '회의'}.webm`,
         uploadedAt: new Date().toISOString(),
         isConsentGiven: true,
       };
 
-      onUpdateMeeting({ recording: metadata });
-      logger.info('Recording metadata saved successfully');
+      onUpdateMeeting({
+        recording: metadata,
+        recordingStatus: 'completed',
+        audioChunks: latestChunks,
+      });
 
-      // 2. 서버 저장이 확인된 후 IndexedDB 임시 청크 삭제
       await removeAudioSession(meeting.id);
+      logger.info('Recording stopped and finalized successfully');
     } catch (err: any) {
-      logger.error('Failed to upload recording', err);
-      setErrorMessage(`녹음 업로드 실패: ${err?.message || '네트워크 오류'}. 다시 시도해주세요.`);
-    } finally {
-      setIsUploading(false);
+      logger.error('Error stopping recording', err);
+      setErrorMessage(`녹음 종료 중 오류: ${err.message}`);
     }
   };
 
   /**
-   * 외부 오디오 파일 업로드 핸들러
+   * 실패한 단일 청크 수동 업로드 재시도
+   */
+  const handleRetryChunkUpload = async (chunk: AudioChunk) => {
+    logger.info('handleRetryChunkUpload called', { chunkId: chunk.id });
+    try {
+      const updated = await retryFailedAudioChunk(meeting.id, chunk.id);
+      if (updated) {
+        setChunks((prev) => {
+          const list = prev.map((c) => (c.id === chunk.id ? updated : c));
+          onUpdateMeeting({ audioChunks: list });
+          return list;
+        });
+      }
+    } catch (err: any) {
+      setErrorMessage(`청크 ${chunk.id} 재업로드 실패: ${err.message}`);
+    }
+  };
+
+  /**
+   * 실패한 단일 청크 개별 전사 재시도
+   */
+  const handleRetrySingleChunkTranscribe = async (chunk: AudioChunk) => {
+    logger.info('handleRetrySingleChunkTranscribe called', { chunkId: chunk.id });
+    try {
+      const res = await transcribeSingleChunk(meeting.id, chunk, {
+        meetingTitle: meeting.title,
+        agenda: meeting.agenda,
+        attendeeNames: meeting.attendees.map((a) => a.name),
+      });
+
+      setChunks((prev) => {
+        const updatedList = prev.map((c) =>
+          c.id === chunk.id
+            ? {
+                ...c,
+                transcriptionStatus: 'completed' as const,
+                transcripts: res.transcripts,
+                provider: res.provider,
+              }
+            : c
+        );
+        const merged = mergeAndDeduplicateTranscripts(updatedList);
+        onUpdateMeeting({ audioChunks: updatedList, transcripts: merged });
+        return updatedList;
+      });
+    } catch (err: any) {
+      setErrorMessage(`구간 전사 재시도 실패: ${err.message}`);
+    }
+  };
+
+  /**
+   * 전체 구간 AI 전사 일괄 실행
+   */
+  const handleBatchTranscribe = async (retryOnlyFailed: boolean = false) => {
+    logger.info('handleBatchTranscribe called', { retryOnlyFailed });
+    if (chunks.length === 0) {
+      setTranscribeError('전사할 오디오 구간이 없습니다.');
+      return;
+    }
+
+    setIsTranscribing(true);
+    setTranscribeError(null);
+    setTranscribeProgressPercent(0);
+    setTranscribeProgressLabel('전사 준비 중...');
+
+    try {
+      const result = await transcribeAllChunks(
+        meeting.id,
+        chunks,
+        {
+          meetingTitle: meeting.title,
+          agenda: meeting.agenda,
+          attendeeNames: meeting.attendees.map((a) => a.name),
+        },
+        (completed, total, percent, label) => {
+          setTranscribeProgressPercent(percent);
+          setTranscribeProgressLabel(label);
+        },
+        retryOnlyFailed
+      );
+
+      // 최신 청크 목록 다시 로드
+      const freshChunks = await getMeetingAudioChunks(meeting.id);
+      setChunks(freshChunks);
+
+      onUpdateMeeting({
+        transcripts: result.allSegments,
+        audioChunks: freshChunks,
+        status: meeting.status === 'draft' ? 'review' : meeting.status,
+        recording: meeting.recording
+          ? {
+              ...meeting.recording,
+              transcriptionProvider: result.primaryProvider as any,
+              fallbackUsed: result.anyFallbackUsed,
+            }
+          : undefined,
+      });
+
+      if (result.failedChunkIds.length > 0) {
+        setTranscribeError(
+          `전체 ${result.totalCount}구간 중 ${result.failedChunkIds.length}개 구간 전사가 실패했습니다. 개별 재시도할 수 있습니다.`
+        );
+      } else {
+        logger.info('All chunks transcribed successfully');
+      }
+    } catch (err: any) {
+      logger.error('Batch transcription failed', err);
+      setTranscribeError(err?.message || '일괄 전사 처리 중 오류가 발생했습니다.');
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  /**
+   * 종합 AI 회의 요약 생성 트리거
+   */
+  const handleGenerateSummary = async () => {
+    logger.info('handleGenerateSummary called');
+    if (!meeting.transcripts || meeting.transcripts.length === 0) {
+      setErrorMessage('먼저 AI 전사를 완료해주세요.');
+      return;
+    }
+
+    setIsSummarizing(true);
+    setErrorMessage(null);
+
+    try {
+      const summary = await requestComprehensiveMeetingSummary(
+        meeting.id,
+        {
+          title: meeting.title,
+          agenda: meeting.agenda,
+          department: meeting.department,
+          date: meeting.date,
+          attendees: meeting.attendees,
+        },
+        meeting.transcripts
+      );
+
+      onUpdateMeeting({ summary });
+      onSwitchToTranscriptTab();
+    } catch (err: any) {
+      logger.error('Generate summary failed', err);
+      setErrorMessage(`회의 요약 생성 실패: ${err.message}`);
+    } finally {
+      setIsSummarizing(false);
+    }
+  };
+
+  /**
+   * 외부 오디오 파일 업로드 (기존 회의 음성 파일 대응)
    */
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    logger.info('Audio file chosen for upload', { fileName: file.name, size: file.size, type: file.type });
 
-    // 용량 제한 검증 (최대 200MB)
     if (file.size > APP_CONFIG.limits.maxRecordingFileSizeBytes) {
-      setErrorMessage(`파일 크기가 200MB를 초과합니다. (현재 크기: ${formatFileSize(file.size)})`);
+      setErrorMessage(`파일 크기가 200MB를 초과합니다. (현재: ${formatFileSize(file.size)})`);
       return;
     }
 
-    setCurrentAudioBlob(file);
     setIsUploading(true);
     setUploadPercent(0);
     setErrorMessage(null);
@@ -207,120 +494,56 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         (pct) => setUploadPercent(pct)
       );
 
-      // 오디오 길이 추정 (브라우저 Audio 태그 활용)
-      const tempAudio = new Audio(URL.createObjectURL(file));
-      tempAudio.onloadedmetadata = () => {
-        const dur = Math.round(tempAudio.duration) || 0;
-        const metadata: RecordingMetadata = {
-          id: 'rec_' + Date.now(),
-          storagePath: uploadRes.storagePath,
-          downloadUrl: uploadRes.downloadUrl,
-          durationSeconds: dur,
-          fileSizeBytes: file.size,
-          mimeType: file.type || 'audio/webm',
-          fileName: file.name,
-          uploadedAt: new Date().toISOString(),
-          isConsentGiven: true,
-        };
-        onUpdateMeeting({ recording: metadata });
-        setIsUploading(false);
+      const metadata: RecordingMetadata = {
+        id: 'rec_' + Date.now(),
+        storagePath: uploadRes.storagePath,
+        downloadUrl: uploadRes.downloadUrl,
+        durationSeconds: 0,
+        fileSizeBytes: file.size,
+        mimeType: file.type || 'audio/webm',
+        fileName: file.name,
+        uploadedAt: new Date().toISOString(),
+        isConsentGiven: true,
       };
-      tempAudio.onerror = () => {
-        const metadata: RecordingMetadata = {
-          id: 'rec_' + Date.now(),
-          storagePath: uploadRes.storagePath,
-          downloadUrl: uploadRes.downloadUrl,
-          durationSeconds: 0,
-          fileSizeBytes: file.size,
-          mimeType: file.type || 'audio/webm',
-          fileName: file.name,
-          uploadedAt: new Date().toISOString(),
-          isConsentGiven: true,
-        };
-        onUpdateMeeting({ recording: metadata });
-        setIsUploading(false);
-      };
+
+      onUpdateMeeting({ recording: metadata, recordingStatus: 'completed' });
+      setIsUploading(false);
     } catch (err: any) {
-      logger.error('Audio file upload failed', err);
-      setErrorMessage(`오디오 파일 업로드 실패: ${err?.message}`);
+      logger.error('File upload failed', err);
+      setErrorMessage(`오디오 파일 업로드 실패: ${err.message}`);
       setIsUploading(false);
     }
   };
 
-  /**
-   * AI 화자별 음성 전사 요청
-   */
-  const handleTriggerTranscription = async () => {
-    logger.info('handleTriggerTranscription called');
-    if (!meeting.recording) {
-      setTranscribeError('전사할 녹음 파일이 존재하지 않습니다.');
-      return;
-    }
-
-    setIsTranscribing(true);
-    setTranscribeError(null);
-
-    try {
-      const attendeeNames = meeting.attendees.map((a) => a.name);
-
-      // 직접 전송을 위한 audioBlob 취득: 메모리 state 확인 후 없으면 downloadUrl에서 fetch
-      let audioBlobToSend = currentAudioBlob;
-      if (!audioBlobToSend && meeting.recording.downloadUrl) {
-        try {
-          logger.info('Attempting to fetch audio blob from downloadUrl', { url: meeting.recording.downloadUrl });
-          const res = await fetch(meeting.recording.downloadUrl);
-          if (res.ok) {
-            audioBlobToSend = await res.blob();
-            setCurrentAudioBlob(audioBlobToSend);
-            logger.info('Audio blob obtained successfully from downloadUrl', {
-              size: audioBlobToSend.size,
-              type: audioBlobToSend.type,
-            });
-          }
-        } catch (blobFetchErr) {
-          logger.warn('Could not fetch audio blob from downloadUrl, proceeding with storage path fallback', blobFetchErr);
-        }
-      }
-
-      const result = await requestTranscriptionDetails({
-        meetingId: meeting.id,
-        audioBlob: audioBlobToSend || undefined,
-        audioStoragePath: meeting.recording.storagePath,
-        audioUrl: meeting.recording.downloadUrl,
-        meetingTitle: meeting.title,
-        agenda: meeting.agenda,
-        attendeeNames,
-      });
-
-      logger.info('Transcription completed, updating meeting', {
-        count: result.transcripts.length,
-        provider: result.provider,
-        fallbackUsed: result.fallbackUsed,
-      });
-
-      onUpdateMeeting({
-        transcripts: result.transcripts,
-        status: meeting.status === 'draft' ? 'review' : meeting.status,
-        recording: {
-          ...meeting.recording,
-          transcriptionProvider: result.provider,
-          fallbackUsed: result.fallbackUsed,
-        },
-      });
-
-      // 대화록 탭으로 자동 전환 안내
-      onSwitchToTranscriptTab();
-    } catch (err: any) {
-      logger.error('Transcription failed', err);
-      setTranscribeError(err?.message || 'AI 음성 전사 처리 중 알 수 없는 오류가 발생했습니다.');
-    } finally {
-      setIsTranscribing(false);
-    }
-  };
+  // 통계 계산
+  const totalChunksCount = chunks.length;
+  const uploadedChunksCount = chunks.filter((c) => c.uploadStatus === 'uploaded').length;
+  const transcribedChunksCount = chunks.filter((c) => c.transcriptionStatus === 'completed').length;
+  const failedTranscribeCount = chunks.filter((c) => c.transcriptionStatus === 'failed').length;
 
   return (
     <div className="space-y-6">
-      {/* 에러 및 주의사항 배너 */}
+      {/* 3시간 도달 알림 모달 */}
+      {maxDurationAlert && (
+        <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl flex items-start space-x-3 text-amber-900 text-xs shadow-sm">
+          <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+          <div className="flex-1 space-y-1">
+            <h4 className="font-bold text-sm">최대 권장 녹음시간(3시간)에 도달했습니다.</h4>
+            <p className="leading-relaxed">
+              데이터의 안정성과 브라우저 메모리 보호를 위해 녹음이 자동으로 안전하게 마무리되었습니다.
+              모든 구간 파일이 클라우드 스토리지에 보존되었으며, 이제 AI 전사를 진행하실 수 있습니다.
+            </p>
+          </div>
+          <button
+            onClick={() => setMaxDurationAlert(false)}
+            className="font-bold text-amber-700 hover:text-amber-900"
+          >
+            확인
+          </button>
+        </div>
+      )}
+
+      {/* 에러 메시지 배너 */}
       {errorMessage && (
         <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex items-start space-x-3 text-red-800 text-xs">
           <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
@@ -331,19 +554,18 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         </div>
       )}
 
-      {/* 안내 박스: 백그라운드 중단 주의 및 개인정보 고지 */}
+      {/* 규정 준수 및 참석자 동의 확인 박스 */}
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-600 space-y-2">
         <div className="flex items-center space-x-2 font-bold text-slate-800">
           <ShieldCheck className="w-4 h-4 text-blue-600" />
-          <span>녹음 및 음성인식 규정 준수 안내</span>
+          <span>장시간(최대 3시간) 고안정성 녹음 및 규정 준수 안내</span>
         </div>
         <p className="leading-relaxed">
-          • 모바일(Android/iOS) 환경에서는 화면 잠금 또는 브라우저 백그라운드 전환 시 녹음이 일시 중단될 수 있습니다. 중요한 회의 녹음 시 화면을 켜두시기 바랍니다. (Screen Wake Lock 자동 시도)
+          • 5분마다 마이크 녹음이 끊김 없이 분할되어 안전한 클라우드 전용 스토리지에 실시간 자동 보관됩니다.
           <br />
-          • 녹음된 오디오는 산업안전보건법 및 개인정보보호법에 따라 암호화된 전용 스토리지에 안전하게 보관됩니다.
+          • 화면 꺼짐 방지(Screen Wake Lock)가 자동으로 활성화됩니다.
         </p>
 
-        {/* 참석자 동의 확인 체크박스 */}
         <label className="flex items-center space-x-2 pt-2 text-slate-900 font-semibold cursor-pointer select-none">
           <input
             type="checkbox"
@@ -354,7 +576,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                 onUpdateMeeting({ recording: { ...meeting.recording, isConsentGiven: e.target.checked } });
               }
             }}
-            disabled={isReadOnly}
+            disabled={isReadOnly || isRecording}
             className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
           />
           <span>[필수] 모든 참석자에게 회의 녹음 및 AI 대화록 처리를 사전 고지하고 동의를 확인하였습니다.</span>
@@ -364,41 +586,56 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
       {/* 녹음 콘솔 메인 카드 */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-6">
         <div className="text-center space-y-2">
-          <div className="text-3xl sm:text-4xl font-mono font-bold text-slate-900 tracking-wider">
-            {recorderState === 'inactive'
-              ? meeting.recording
-                ? formatDuration(meeting.recording.durationSeconds)
-                : '00:00:00'
-              : formatDuration(recordDuration)}
+          {/* 타이머 */}
+          <div className="text-4xl sm:text-5xl font-mono font-bold text-slate-900 tracking-wider">
+            {isRecording
+              ? formatSeconds(recordDuration)
+              : meeting.recording
+              ? formatSeconds(meeting.recording.durationSeconds)
+              : '00:00:00'}
           </div>
+
+          {/* 상태 배지 */}
           <div className="flex items-center justify-center space-x-2 text-xs">
             <span
               className={`w-2.5 h-2.5 rounded-full ${
-                recorderState === 'recording'
+                isRecording && !isPaused
                   ? 'bg-red-500 animate-ping'
-                  : recorderState === 'paused'
+                  : isPaused
                   ? 'bg-amber-500'
+                  : totalChunksCount > 0
+                  ? 'bg-green-500'
                   : 'bg-slate-300'
               }`}
             />
             <span className="font-semibold text-slate-600">
-              {recorderState === 'recording'
-                ? '실시간 녹음 중...'
-                : recorderState === 'paused'
-                ? '일시 정지됨'
-                : meeting.recording
-                ? '녹음 파일 등록 완료'
-                : '대기 중'}
+              {isRecording && !isPaused
+                ? `실시간 녹음 중 (현재 ${activeChunkIndex}구간)`
+                : isPaused
+                ? '녹음 일시 정지됨'
+                : totalChunksCount > 0
+                ? `${totalChunksCount}개 구간 저장 완료`
+                : '녹음 대기 중'}
             </span>
           </div>
 
+          {/* 실시간 5분 청크 저장 현황 배지 */}
+          {totalChunksCount > 0 && (
+            <div className="inline-flex items-center space-x-2 px-3 py-1 bg-blue-50 text-blue-800 rounded-full text-xs font-semibold border border-blue-100 mt-1">
+              <Layers className="w-3.5 h-3.5 text-blue-600" />
+              <span>
+                {uploadedChunksCount} / {totalChunksCount} 구간 저장 완료 (5분 자동 분할)
+              </span>
+            </div>
+          )}
+
           {/* 마이크 입력 음량 게이지 바 */}
-          {recorderState !== 'inactive' && (
+          {isRecording && (
             <div className="max-w-xs mx-auto pt-2">
               <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1">
                 <span className="flex items-center">
                   <Volume2 className="w-3 h-3 mr-1" />
-                  입력 음량
+                  마이크 음량
                 </span>
                 <span>{inputVolume}%</span>
               </div>
@@ -415,9 +652,10 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         {/* 녹음 제어 버튼 군 */}
         {!isReadOnly && (
           <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
-            {recorderState === 'inactive' ? (
+            {!isRecording ? (
               <button
                 type="button"
+                id="btn-start-chunk-recording"
                 onClick={handleStartRecording}
                 disabled={!isConsentChecked}
                 className="flex items-center space-x-2 px-6 py-3 bg-red-600 hover:bg-red-500 active:bg-red-700 text-white font-bold text-sm rounded-xl shadow transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -427,7 +665,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
               </button>
             ) : (
               <>
-                {recorderState === 'recording' ? (
+                {!isPaused ? (
                   <button
                     type="button"
                     onClick={handlePauseRecording}
@@ -449,6 +687,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
 
                 <button
                   type="button"
+                  id="btn-stop-chunk-recording"
                   onClick={handleStopRecording}
                   className="flex items-center space-x-1.5 px-5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl transition-colors"
                 >
@@ -458,8 +697,8 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
               </>
             )}
 
-            {/* 기존 녹음 파일 업로드 버튼 */}
-            {recorderState === 'inactive' && (
+            {/* 외부 오디오 파일 업로드 */}
+            {!isRecording && (
               <>
                 <button
                   type="button"
@@ -467,7 +706,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                   className="flex items-center space-x-2 px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold text-xs rounded-xl transition-colors"
                 >
                   <Upload className="w-4 h-4 text-slate-600" />
-                  <span>오디오 파일 업로드</span>
+                  <span>기존 음성 파일 첨부</span>
                 </button>
                 <input
                   ref={fileInputRef}
@@ -481,7 +720,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
           </div>
         )}
 
-        {/* 업로드 진행 상태 표시 바 */}
+        {/* 파일 업로드 진행 표시 바 */}
         {isUploading && (
           <div className="p-4 bg-blue-50 border border-blue-200 rounded-xl space-y-2">
             <div className="flex items-center justify-between text-xs font-semibold text-blue-900">
@@ -498,55 +737,45 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         )}
       </div>
 
-      {/* 등록된 녹음 재생 및 AI 전사 제어 카드 */}
-      {meeting.recording && (
+      {/* 5분 구간(Chunk) 목록 및 AI 전사 관리 카드 */}
+      {totalChunksCount > 0 && (
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
-            <div className="flex items-center space-x-3">
-              <div className="p-2.5 bg-blue-50 text-blue-600 rounded-lg">
-                <FileAudio className="w-5 h-5" />
-              </div>
-              <div>
-                <h4 className="text-sm font-bold text-slate-900">{meeting.recording.fileName}</h4>
-                <p className="text-xs text-slate-500 flex items-center gap-1.5 flex-wrap">
-                  <span>길이: {formatDuration(meeting.recording.durationSeconds)}</span>
-                  <span>|</span>
-                  <span>크기: {formatFileSize(meeting.recording.fileSizeBytes)}</span>
-                  <span>|</span>
-                  <span>형식: {meeting.recording.mimeType}</span>
-                  {meeting.recording.transcriptionProvider && (
-                    <>
-                      <span>|</span>
-                      <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 text-slate-600 border border-slate-200/80">
-                        AI 전사 엔진: {meeting.recording.transcriptionProvider === 'openai' ? 'OpenAI' : 'Gemini (Fallback)'}
-                      </span>
-                    </>
-                  )}
-                </p>
-              </div>
+            <div>
+              <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                <Layers className="w-4 h-4 text-blue-600" />
+                <span>5분 단위 녹음 구간 목록 ({totalChunksCount}개 구간)</span>
+              </h4>
+              <p className="text-xs text-slate-500 mt-0.5">
+                저장: {uploadedChunksCount}/{totalChunksCount} 완료 | AI 전사: {transcribedChunksCount}/
+                {totalChunksCount} 완료
+                {failedTranscribeCount > 0 && (
+                  <span className="text-red-600 font-semibold ml-1">({failedTranscribeCount}구간 실패)</span>
+                )}
+              </p>
             </div>
 
-            <div className="flex items-center space-x-2">
-              {/* 원본 오디오 다운로드 */}
-              {meeting.recording.downloadUrl && (
-                <a
-                  href={meeting.recording.downloadUrl}
-                  download={meeting.recording.fileName}
-                  className="inline-flex items-center space-x-1 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg transition-colors"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>다운로드</span>
-                </a>
-              )}
+            {/* 일괄 전사 및 요약 액션 버튼 군 */}
+            {!isReadOnly && !isRecording && (
+              <div className="flex items-center space-x-2 flex-wrap">
+                {failedTranscribeCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => handleBatchTranscribe(true)}
+                    disabled={isTranscribing}
+                    className="flex items-center space-x-1 px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>실패 구간({failedTranscribeCount}) 재전사</span>
+                  </button>
+                )}
 
-              {/* AI 전사 실행 버튼 */}
-              {!isReadOnly && (
                 <button
                   type="button"
-                  id="btn-ai-transcribe"
-                  onClick={handleTriggerTranscription}
+                  id="btn-batch-transcribe"
+                  onClick={() => handleBatchTranscribe(false)}
                   disabled={isTranscribing}
-                  className="flex items-center space-x-2 px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-bold rounded-lg shadow-sm transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                  className="flex items-center space-x-1.5 px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-bold rounded-lg shadow-sm transition-all disabled:opacity-60"
                 >
                   {isTranscribing ? (
                     <RefreshCw className="w-3.5 h-3.5 animate-spin" />
@@ -555,61 +784,196 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                   )}
                   <span>
                     {isTranscribing
-                      ? 'AI가 회의 음성을 분석하고 있습니다...'
-                      : transcribeError
-                      ? 'AI 화자 분리 전사 재시도'
-                      : 'AI 화자 분리 전사'}
+                      ? 'AI 전사 진행 중...'
+                      : transcribedChunksCount > 0
+                      ? '전체 구간 재전사'
+                      : '전체 구간 AI 화자 분리 전사'}
                   </span>
                 </button>
-              )}
-            </div>
+
+                {transcribedChunksCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleGenerateSummary}
+                    disabled={isSummarizing}
+                    className="flex items-center space-x-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg shadow-sm transition-all disabled:opacity-60"
+                  >
+                    {isSummarizing ? (
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                    )}
+                    <span>종합 회의록 요약 생성</span>
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
-          {/* AI 전사 분석 진행 중 로딩 배너 */}
+          {/* 일괄 전사 진행 상태 표시줄 */}
           {isTranscribing && (
-            <div className="p-4 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center space-x-3 text-indigo-900 text-xs animate-pulse">
-              <RefreshCw className="w-5 h-5 animate-spin text-indigo-600 shrink-0" />
-              <div>
-                <p className="font-bold text-sm">AI가 회의 음성을 분석하고 있습니다...</p>
-                <p className="text-indigo-600 text-xs mt-0.5">
-                  화자 분리(Diarization) 및 회의 대화록을 생성하고 있습니다. 오디오 길이에 따라 약 5~20초 소요됩니다.
-                </p>
+            <div className="p-4 bg-indigo-50 border border-indigo-200 rounded-xl space-y-2">
+              <div className="flex items-center justify-between text-xs font-bold text-indigo-900">
+                <span className="flex items-center space-x-1.5">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-600" />
+                  <span>{transcribeProgressLabel}</span>
+                </span>
+                <span>{transcribeProgressPercent}%</span>
               </div>
+              <div className="w-full bg-indigo-200 h-2 rounded-full overflow-hidden">
+                <div
+                  className="bg-indigo-600 h-full transition-all duration-300"
+                  style={{ width: `${transcribeProgressPercent}%` }}
+                />
+              </div>
+              <p className="text-[11px] text-indigo-600">
+                OpenAI 및 Gemini 엔진을 통해 동시 최대 2개 구간씩 순차/병렬 전사를 수행하고 있습니다.
+              </p>
             </div>
           )}
 
-          {/* 오디오 플레이어 (전사 실패 시에도 완벽 유지) */}
-          {meeting.recording.downloadUrl && (
-            <div className="pt-2">
-              <audio
-                ref={audioPlayerRef}
-                controls
-                src={meeting.recording.downloadUrl}
-                className="w-full h-10 rounded-lg"
-              />
-            </div>
-          )}
-
-          {/* AI 전사 에러 배너 (전사 실패 시 표시되며 재시도 가능) */}
+          {/* 전사 에러 배너 */}
           {transcribeError && (
             <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex items-start space-x-3 text-xs text-red-800">
               <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
               <div className="flex-1 space-y-1">
-                <p className="font-bold">AI 화자 분리 전사 실패</p>
-                <p className="text-red-700 leading-relaxed">{transcribeError}</p>
-                <p className="text-[11px] text-red-500 pt-1">
-                  기존 녹음 파일과 재생 기능은 안전하게 유지됩니다. 설정 또는 네트워크 상태를 확인한 후 상단의 [AI 화자 분리 전사 재시도] 버튼을 클릭해주세요.
-                </p>
+                <p className="font-bold">AI 전사 안내</p>
+                <p className="text-red-700">{transcribeError}</p>
               </div>
               <button
                 type="button"
                 onClick={() => setTranscribeError(null)}
-                className="font-bold text-red-600 hover:text-red-800 px-2 py-1 text-xs"
+                className="font-bold text-red-600 hover:text-red-800"
               >
                 닫기
               </button>
             </div>
           )}
+
+          {/* 각 5분 Chunk 세부 카드 목록 */}
+          <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
+            {chunks.map((chunk) => {
+              const timeLabel = `${formatSeconds(chunk.startSeconds)} ~ ${formatSeconds(chunk.endSeconds)}`;
+              const isChunkUploading = chunk.uploadStatus === 'uploading';
+              const isChunkUploadFailed = chunk.uploadStatus === 'failed';
+              const isChunkTranscribing = chunk.transcriptionStatus === 'processing';
+              const isChunkTranscribeCompleted = chunk.transcriptionStatus === 'completed';
+              const isChunkTranscribeFailed = chunk.transcriptionStatus === 'failed';
+
+              return (
+                <div
+                  key={chunk.id}
+                  className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs hover:bg-slate-100/80 transition-colors"
+                >
+                  <div className="flex items-center space-x-3">
+                    <div className="w-7 h-7 rounded-lg bg-blue-100 text-blue-800 font-bold flex items-center justify-center text-xs shrink-0">
+                      {chunk.index}
+                    </div>
+                    <div>
+                      <div className="flex items-center space-x-2">
+                        <span className="font-bold text-slate-900">제{chunk.index}구간</span>
+                        <span className="font-mono text-slate-500">({timeLabel})</span>
+                        {chunk.fileSizeBytes && (
+                          <span className="text-[11px] text-slate-400">
+                            {formatFileSize(chunk.fileSizeBytes)}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* 상태 태그 */}
+                      <div className="flex items-center space-x-2 mt-1">
+                        {/* 스토리지 업로드 상태 */}
+                        {isChunkUploading ? (
+                          <span className="inline-flex items-center text-blue-600">
+                            <RefreshCw className="w-3 h-3 animate-spin mr-1" />
+                            업로드 중...
+                          </span>
+                        ) : isChunkUploadFailed ? (
+                          <span className="inline-flex items-center text-red-600 font-semibold">
+                            <AlertTriangle className="w-3 h-3 mr-1" />
+                            업로드 실패
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center text-green-700">
+                            <Check className="w-3 h-3 mr-1" />
+                            저장 완료
+                          </span>
+                        )}
+
+                        <span>•</span>
+
+                        {/* AI 전사 상태 */}
+                        {isChunkTranscribing ? (
+                          <span className="inline-flex items-center text-indigo-600">
+                            <RefreshCw className="w-3 h-3 animate-spin mr-1" />
+                            AI 전사 중...
+                          </span>
+                        ) : isChunkTranscribeCompleted ? (
+                          <span className="inline-flex items-center text-emerald-700 font-semibold">
+                            <CheckCircle2 className="w-3 h-3 mr-1" />
+                            전사 완료 ({chunk.transcripts?.length || 0}개 발언)
+                          </span>
+                        ) : isChunkTranscribeFailed ? (
+                          <span className="inline-flex items-center text-red-600 font-semibold">
+                            <AlertTriangle className="w-3 h-3 mr-1" />
+                            전사 실패
+                          </span>
+                        ) : (
+                          <span className="text-slate-400">전사 대기</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 구간별 오디오 플레이어 & 액션 */}
+                  <div className="flex items-center space-x-2 self-end sm:self-center">
+                    {/* 오디오 플레이어 */}
+                    {chunk.downloadUrl && (
+                      <audio controls src={chunk.downloadUrl} className="h-8 w-48 sm:w-56" />
+                    )}
+
+                    {/* 다운로드 버튼 */}
+                    {chunk.downloadUrl && (
+                      <a
+                        href={chunk.downloadUrl}
+                        download={`회의구간_${chunk.index}.webm`}
+                        title="해당 구간 다운로드"
+                        className="p-1.5 text-slate-500 hover:text-slate-800 bg-white border border-slate-200 rounded-md"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                      </a>
+                    )}
+
+                    {/* 업로드 실패 재시도 */}
+                    {isChunkUploadFailed && !isReadOnly && (
+                      <button
+                        type="button"
+                        onClick={() => handleRetryChunkUpload(chunk)}
+                        className="px-2 py-1 bg-red-600 text-white rounded text-[11px] font-bold hover:bg-red-500"
+                      >
+                        저장 재시도
+                      </button>
+                    )}
+
+                    {/* 개별 전사 재시도 */}
+                    {(isChunkTranscribeFailed || (!isChunkTranscribeCompleted && !isTranscribing)) &&
+                      !isReadOnly &&
+                      !isChunkUploading &&
+                      !isChunkUploadFailed && (
+                        <button
+                          type="button"
+                          onClick={() => handleRetrySingleChunkTranscribe(chunk)}
+                          disabled={isChunkTranscribing || isTranscribing}
+                          className="px-2.5 py-1 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded text-[11px] font-semibold transition-colors disabled:opacity-50"
+                        >
+                          {isChunkTranscribeFailed ? '재전사' : '구간 전사'}
+                        </button>
+                      )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
     </div>

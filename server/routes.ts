@@ -17,6 +17,7 @@ import {
 import { downloadMeetingAudioFromStorage } from './storage.js';
 import { summarizeMeetingWithGemini } from './gemini.js';
 import { executeTranscription } from './ai/transcriptionService.js';
+import { generateMeetingSummary } from './ai/meetingSummaryService.js';
 
 export const apiRouter = express.Router();
 
@@ -357,6 +358,214 @@ apiRouter.post(
       return res.status(statusCode).json({
         success: false,
         error: err.message || '회의록 요약 처리 중 서버 오류가 발생했습니다.',
+        detail: err.detail || err.details || err.code || String(err),
+      });
+    }
+  }
+);
+
+/**
+ * 5분 단위 개별 오디오 청크 AI 전사 엔드포인트: POST /api/ai/transcribe-chunk
+ * 장시간 회의에서 생성된 5분 분할 Chunk를 개별 다운로드하여 OpenAI/Gemini 전사 수행.
+ * 타임스탬프 오프셋(startSeconds) 및 화자 번호 충돌 방지를 보정하여 반환합니다.
+ */
+apiRouter.post(
+  '/ai/transcribe-chunk',
+  async (req: AuthenticatedRequest, res: Response) => {
+    console.log('[ROUTES] POST /api/ai/transcribe-chunk called');
+
+    try {
+      // 1. 인증 토큰 확인
+      const authHeader = req.headers.authorization;
+      const token = extractBearerToken(authHeader);
+
+      if (!token) {
+        return res.status(401).json({
+          success: false,
+          error: '인증이 필요합니다. 먼저 로그인해주세요.',
+          detail: 'UNAUTHORIZED',
+        });
+      }
+
+      const user = await verifyFirebaseIdToken(token);
+      req.user = user;
+
+      // 2. 파라미터 파싱
+      const meetingId = String(req.body.meetingId || '').trim();
+      const chunkId = String(req.body.chunkId || '').trim();
+      const chunkIndex = typeof req.body.chunkIndex === 'number' ? req.body.chunkIndex : 0;
+      const startSeconds = typeof req.body.startSeconds === 'number' ? req.body.startSeconds : 0;
+      const endSeconds = typeof req.body.endSeconds === 'number' ? req.body.endSeconds : startSeconds + 300;
+      const meetingTitle = req.body.meetingTitle || '';
+      const agenda = req.body.agenda || '';
+      let attendeeNames: string[] = [];
+
+      if (req.body.attendeeNames) {
+        try {
+          attendeeNames =
+            typeof req.body.attendeeNames === 'string'
+              ? JSON.parse(req.body.attendeeNames)
+              : req.body.attendeeNames;
+        } catch {
+          // 무시
+        }
+      }
+
+      if (!meetingId || !chunkId) {
+        return res.status(400).json({
+          success: false,
+          error: 'meetingId와 chunkId는 필수 항목입니다.',
+          detail: 'MISSING_PARAMETERS',
+        });
+      }
+
+      // 3. 회의 접근 권한 검증
+      const hasAccess = await verifyMeetingAccess(user.uid, meetingId, token);
+      if (!hasAccess) {
+        return res.status(403).json({
+          success: false,
+          error: '해당 회의록에 대한 권한이 없습니다.',
+          detail: 'FORBIDDEN',
+        });
+      }
+
+      // 4. 스토리지 경로 결정 및 검증
+      let audioStoragePath = req.body.audioStoragePath ? String(req.body.audioStoragePath).trim() : '';
+      if (!audioStoragePath) {
+        audioStoragePath = `meetings/${meetingId}/audio/chunks/${chunkId}.webm`;
+      }
+
+      console.log('[ROUTES] Downloading chunk from storage', { meetingId, chunkId, audioStoragePath });
+
+      // 5. Firebase Storage에서 오디오 다운로드
+      const downloaded = await downloadMeetingAudioFromStorage(
+        meetingId,
+        audioStoragePath,
+        req.body.audioUrl,
+        token
+      );
+
+      // 6. 전사 파이프라인 호출 (OpenAI 우선 + Gemini Fallback)
+      const result = await executeTranscription(downloaded.buffer, downloaded.mimeType, {
+        meetingId,
+        meetingTitle,
+        agenda,
+        attendeeNames,
+        timeOffsetSeconds: startSeconds,
+        chunkIndex,
+      });
+
+      console.log('[ROUTES] Chunk transcription succeeded', {
+        chunkId,
+        provider: result.provider,
+        segmentCount: result.transcripts.length,
+      });
+
+      return res.json({
+        success: true,
+        chunkId,
+        chunkIndex,
+        provider: result.provider,
+        fallbackUsed: result.fallbackUsed,
+        speakers: result.speakers,
+        fullTranscript: result.fullTranscript,
+        transcripts: result.transcripts,
+        startSeconds,
+        endSeconds,
+      });
+    } catch (err: any) {
+      console.error('[ROUTES] POST /api/ai/transcribe-chunk failed', err);
+      const statusCode = err.statusCode || 500;
+      return res.status(statusCode).json({
+        success: false,
+        chunkId: req.body?.chunkId,
+        error: err.userMessage || err.message || '청크 음성 전사 중 오류가 발생했습니다.',
+        detail: err.detail || err.details || err.code || String(err),
+      });
+    }
+  }
+);
+
+/**
+ * 전체 회의 대화록 기반 종합 회의 요약 엔드포인트: POST /api/ai/summarize-meeting
+ * 병합된 회의 전사문과 메타데이터를 기반으로 종합 개요, 결정사항, Action Items를 JSON 생성.
+ */
+apiRouter.post(
+  '/ai/summarize-meeting',
+  async (req: AuthenticatedRequest, res: Response) => {
+    console.log('[ROUTES] POST /api/ai/summarize-meeting called');
+
+    try {
+      // 1. 인증 확인
+      const authHeader = req.headers.authorization;
+      const token = extractBearerToken(authHeader);
+
+      if (!token) {
+        return res.status(401).json({
+          success: false,
+          error: '인증이 필요합니다. 먼저 로그인해주세요.',
+          detail: 'UNAUTHORIZED',
+        });
+      }
+
+      const user = await verifyFirebaseIdToken(token);
+      req.user = user;
+
+      const meetingId = String(req.body.meetingId || '').trim();
+      const title = String(req.body.title || req.body.meetingTitle || '회의').trim();
+      const agenda = String(req.body.agenda || '').trim();
+      const department = String(req.body.department || '').trim();
+      const date = String(req.body.date || '').trim();
+      const attendees = Array.isArray(req.body.attendees) ? req.body.attendees : [];
+      const fullTranscript = String(req.body.fullTranscript || '').trim();
+
+      if (!meetingId) {
+        return res.status(400).json({
+          success: false,
+          error: 'meetingId는 필수 항목입니다.',
+          detail: 'MISSING_MEETING_ID',
+        });
+      }
+
+      if (!fullTranscript) {
+        return res.status(400).json({
+          success: false,
+          error: '요약할 회의 전사문(fullTranscript)이 비어 있습니다.',
+          detail: 'EMPTY_TRANSCRIPT',
+        });
+      }
+
+      // 2. 권한 확인
+      const hasAccess = await verifyMeetingAccess(user.uid, meetingId, token);
+      if (!hasAccess) {
+        return res.status(403).json({
+          success: false,
+          error: '해당 회의에 대한 접근 권한이 없습니다.',
+          detail: 'FORBIDDEN',
+        });
+      }
+
+      // 3. 종합 요약 생성
+      const summaryResult = await generateMeetingSummary({
+        meetingId,
+        title,
+        agenda,
+        department,
+        date,
+        attendees,
+        fullTranscript,
+      });
+
+      return res.json({
+        success: true,
+        summary: summaryResult,
+      });
+    } catch (err: any) {
+      console.error('[ROUTES] POST /api/ai/summarize-meeting failed', err);
+      const statusCode = err.statusCode || 500;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || '종합 회의 요약 생성 중 오류가 발생했습니다.',
         detail: err.detail || err.details || err.code || String(err),
       });
     }

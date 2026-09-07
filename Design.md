@@ -317,6 +317,57 @@ Vercel에서 Vite SPA 화면과 Express 백엔드 API를 동시에 배포할 때
      - `[transcription] Gemini fallback success` (또는 `failure`)
    - API Key는 어떠한 로그에도 절대 출력하지 않음.
 
+---
+
+## 9. 장시간(최대 3시간) 업무용 회의 5분 단위 Chunk 아키텍처 (Long-Meeting Chunk Architecture)
+
+### 9.1. 핵심 아키텍처 및 처리 흐름
+장시간(최대 3시간 = 180분) 회의 시 수백 MB의 대용량 단일 오디오 Blob을 Vercel 서버리스 API로 일괄 전송할 경우 발생하는 **서버 타임아웃(Vercel 60초 제한) 및 페이로드 크기 한도(4.5MB) 초과 문제를 원천적으로 해결**하기 위해, 5분 단위 무중단 자동 Chunk 분할 및 클라우드 직업로드 파이프라인을 구축하였습니다.
+
+```
+브라우저 마이크 녹음 (최초 1회 MediaStream 획득 후 회의 종료 시까지 계속 활성 유지)
+        ↓
+5분 경과 시 자동 무중단 교체 (이전 MediaRecorder stop -> 즉시 새 MediaRecorder start)
+        ↓
+브라우저 로컬 백업 (IndexedDB 'audio_5min_chunks' 스토어에 오디오 Blob 즉시 보존)
+        ↓
+Firebase Cloud Storage 직접 업로드 (지수 백오프 2s/5s/10s 재시도)
+        ↓
+Firestore 청크 메타데이터 저장 (meetings/{meetingId}/audioChunks/chunk_XXX)
+        ↓
+다음 5분 녹음 계속 (회의 종료 시까지 반복)
+        ↓
+회의 종료 및 저장 완료 (UI에 "N / N 구간 저장 완료" 실시간 표시)
+        ↓
+AI 일괄 전사 요청 (동시 2개 청크 제한 워커 풀로 순차/병렬 전사: POST /api/ai/transcribe-chunk)
+        ↓
+타임스탬프 오프셋 보정 및 대화록 병합 (경계 중복 발언 안전 필터링)
+        ↓
+종합 AI 회의록 요약 생성 (POST /api/ai/summarize-meeting)
+```
+
+### 9.2. 주요 구성 요소
+1. **ChunkAudioRecorder (`src/services/chunkAudioRecorder.ts`)**:
+   - 5분(300,000ms)마다 온전한 WebM 바이너리 Blob을 생성하고, 마이크 스트림을 유지한 채 즉시 다음 청크 녹음을 이어가 녹음 단절을 원천 방지합니다.
+   - Screen Wake Lock API를 적용하여 모바일 및 데스크톱 환경의 화면 꺼짐 및 절전 모드 진입을 방지합니다.
+   - 최대 권장 녹음시간 3시간(10,800초) 도달 시 사용자 안내와 함께 마지막 구간을 안전하게 저장하고 녹음을 자동 종료합니다.
+2. **IndexedDB 오디오 백업 (`src/services/indexedDbAudio.ts`)**:
+   - `audio_5min_chunks` 스토어를 통해 네트워크 단절이나 브라우저 비정상 종료 시에도 로컬에 저장된 5분 청크 Blob을 안전하게 복구할 수 있도록 보장합니다.
+3. **클라우드 스토리지 직업로드 (`src/services/storageService.ts` & `audioChunkService.ts`)**:
+   - 오디오는 `meetings/{meetingId}/audio/chunks/chunk_XXX.webm` 경로로 Firebase Cloud Storage에 직접 업로드되며, 2초/5초/10초 지수 백오프 재시도를 지원합니다.
+4. **전사 오케스트레이션 (`src/services/transcriptionClientService.ts`)**:
+   - API Rate Limit을 방지하기 위해 동시 최대 2개 청크씩 순차/병렬 전사를 수행합니다.
+   - 이미 성공한 구간은 중복 호출하지 않으며, 실패한 구간만 타겟팅하여 부분 재시도할 수 있습니다.
+   - 각 청크의 시작 시간(`startSeconds`)을 세그먼트 타임스탬프에 정확히 가산하여 전체 회의 타임라인을 일관되게 복원합니다.
+5. **종합 회의록 요약 (`server/ai/meetingSummaryService.ts`)**:
+   - 병합된 전체 대화록을 바탕으로 핵심 개요(overview), 주요 논의사항(keyDiscussions), 결정사항(decisions), Action Items(담당자/기한/신뢰도), 미결사항(pendingIssues), 후속 조치(nextSteps)를 구조화된 JSON으로 생성합니다.
+
+### 9.3. 장애 격리 및 데이터 무결성 보장
+- **부분 실패 격리**: 특정 청크의 전사가 일시적으로 실패하더라도 전체 회의가 실패하지 않으며, 성공한 구간은 그대로 보존됩니다.
+- **재시도 멱등성**: 재시도 시 이미 완료된 청크의 API 비용을 낭비하지 않고 실패한 청크만 재요청합니다.
+- **단일 파일 호환성**: 사용자가 외부에서 녹음된 단일 오디오 파일(MP3, M4A, WAV 등)을 직접 업로드하는 경우에도 기존 단일 파일 전사 파이프라인과 완벽하게 상호 호환됩니다.
+
+
 
 
 

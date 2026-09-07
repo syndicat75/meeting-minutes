@@ -111,10 +111,15 @@ export interface AgendaDiscussion {
  */
 export interface MeetingSummary {
   executiveSummary: string; // 핵심 요약
+  overview?: string; // 전체 회의 개요
+  keyDiscussions?: string[]; // 주요 논의사항
   agendaDiscussions: AgendaDiscussion[];
   decisions: Array<{ text: string; evidenceSegmentIds?: string[] }>; // 결정 사항
   pendingItems: Array<{ text: string; evidenceSegmentIds?: string[] }>; // 미결 사항
+  pendingIssues?: string[]; // 미결 사항 문자열 목록
+  nextSteps?: string[]; // 차기 회의 또는 후속 조치 사항
   actionItems: ActionItem[]; // 후속 조치
+  structuredActionItems?: StructuredActionItem[];
   suggestedContentRows: MeetingContentRow[]; // 첨부 양식의 '구분 / 내용' 표 추천안
   riskAssessments?: Array<{ // 위험성평가 특화 항목
     riskFactor: string;
@@ -157,6 +162,71 @@ export interface RecordingMetadata {
   tempIndexedDbKey?: string; // 오프라인/임시 복구 키
   transcriptionProvider?: 'openai' | 'gemini'; // 사용된 전사 엔진
   fallbackUsed?: boolean; // Gemini fallback 전환 여부
+}
+
+/**
+ * 5분 단위 오디오 청크 업로드 상태
+ */
+export type ChunkUploadStatus = 'recording' | 'uploading' | 'uploaded' | 'failed';
+
+/**
+ * 5분 단위 오디오 청크 전사 상태
+ */
+export type ChunkTranscriptionStatus = 'pending' | 'processing' | 'completed' | 'failed';
+
+/**
+ * 5분 단위 오디오 청크 데이터 모델 (meetings/{meetingId}/audioChunks/{chunkId})
+ */
+export interface AudioChunk {
+  id: string; // 예: chunk_0001
+  meetingId: string;
+  index: number; // 1부터 시작 (1, 2, 3...)
+  storagePath: string; // meetings/{meetingId}/audio/chunks/chunk_0001.webm
+  downloadUrl?: string;
+  startSeconds: number; // 구간 시작 초 (예: 0, 300, 600...)
+  endSeconds: number; // 구간 종료 초 (예: 300, 600, 900...)
+  duration: number; // 구간 길이 (초)
+  durationSeconds?: number; // duration 별칭
+  size: number; // 파일 크기 (바이트)
+  fileSizeBytes?: number; // size 별칭
+  mimeType: string; // audio/webm, audio/mp4 등
+  uploadStatus: ChunkUploadStatus;
+  transcriptionStatus: ChunkTranscriptionStatus;
+  transcriptionAttempts: number;
+  transcriptionStartedAt?: string;
+  transcriptionCompletedAt?: string;
+  provider?: 'openai' | 'gemini' | null;
+  model?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  createdAt: string;
+  transcripts?: TranscriptSegment[];
+}
+
+/**
+ * 회의 전체 녹음 상태 모델
+ */
+export type MeetingRecordingStatus = 'idle' | 'recording' | 'finalizing' | 'recorded' | 'failed';
+
+/**
+ * 회의 전체 전사 상태 모델
+ */
+export type MeetingTranscriptionStatus = 'not_started' | 'queued' | 'processing' | 'partial' | 'completed' | 'failed';
+
+/**
+ * 회의 요약 생성 상태 모델
+ */
+export type MeetingSummaryStatus = 'not_started' | 'processing' | 'completed' | 'failed';
+
+/**
+ * 구조화된 Action Item 인터페이스
+ */
+export interface StructuredActionItem {
+  task: string;
+  assignee: string | null;
+  dueDate: string | null;
+  sourceTimestamp?: number;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 /**
@@ -258,6 +328,13 @@ export interface Meeting {
   
   // 녹음 및 대화록
   recording?: RecordingMetadata;
+  recordingStatus?: MeetingRecordingStatus;
+  transcriptionStatus?: MeetingTranscriptionStatus;
+  summaryStatus?: MeetingSummaryStatus;
+  audioChunks?: AudioChunk[];
+  totalChunksCount?: number;
+  uploadedChunksCount?: number;
+  transcribedChunksCount?: number;
   transcripts: TranscriptSegment[];
   speakerMapping: Record<string, string>; // speakerId -> attendeeId
   
