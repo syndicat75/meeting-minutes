@@ -91,13 +91,25 @@ export async function transcribeSingleChunk(
   });
 
   if (!response.ok) {
-    let errorDetail = '전사 API 요청 실패';
+    let errorDetail = `전사 API 요청 실패 (HTTP ${response.status})`;
     try {
       const errJson = await response.json();
-      errorDetail = errJson.error || errJson.detail || errorDetail;
+      if (errJson.error) {
+        errorDetail = errJson.detail && errJson.detail !== errJson.error
+          ? `${errJson.error} - ${errJson.detail}`
+          : errJson.error;
+      } else if (errJson.detail) {
+        errorDetail = errJson.detail;
+      }
     } catch {
       // 무시
     }
+
+    console.error('[transcriptionClientService] Chunk transcription failed', {
+      chunkId: chunk.id,
+      status: response.status,
+      errorDetail,
+    });
 
     await updateChunkTranscriptionStatus(meetingId, chunk.id, {
       transcriptionStatus: 'failed',
@@ -109,7 +121,7 @@ export async function transcribeSingleChunk(
   }
 
   const data = await response.json();
-  const rawSegments: any[] = data.transcripts || [];
+  const rawSegments: any[] = data.transcripts || data.segments || [];
 
   // 시간 오프셋 보정 및 클라이언트 TranscriptSegment 규격 정규화
   const adjustedSegments: TranscriptSegment[] = rawSegments.map((seg, idx) => ({

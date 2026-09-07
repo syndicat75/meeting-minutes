@@ -141,11 +141,15 @@ function parseOpenAIDiarizationResponse(
       const startTime = typeof seg.start === 'number' ? seg.start : typeof seg.startTime === 'number' ? seg.startTime : 0;
       const endTime = typeof seg.end === 'number' ? seg.end : typeof seg.endTime === 'number' ? seg.endTime : startTime + 2;
       
-      // 화자 식별자 정규화: "speaker_0" -> "화자 1", "0" -> "화자 1", "A" -> "화자 A"
+      // 화자 식별자 정규화: "A" -> "화자 1", "speaker_0" -> "화자 1", "0" -> "화자 1"
       let rawSpeaker = String(seg.speaker || seg.speaker_label || seg.speakerId || `화자 ${idx + 1}`).trim();
       let speakerDisplayName = rawSpeaker;
 
-      if (/^speaker[_-]?(\d+)$/i.test(rawSpeaker)) {
+      if (/^[A-Z]$/.test(rawSpeaker)) {
+        // 알파벳 화자 레이블 (A -> 화자 1, B -> 화자 2 등)
+        const code = rawSpeaker.charCodeAt(0) - 64;
+        speakerDisplayName = `화자 ${code}`;
+      } else if (/^speaker[_-]?(\d+)$/i.test(rawSpeaker)) {
         const num = parseInt(rawSpeaker.replace(/^speaker[_-]?/i, ''), 10);
         speakerDisplayName = `화자 ${num + 1}`;
       } else if (/^\d+$/.test(rawSpeaker)) {
@@ -265,18 +269,28 @@ export async function transcribeAudioWithOpenAI(
     const fileName = `meeting_${Date.now()}.${extension}`;
     const file = await toFile(audioBuffer, fileName, { type: normalizedMime });
 
-    // 2. OpenAI 오디오 전사 API 호출
-    const promptHint = context.attendeeNames && context.attendeeNames.length > 0
-      ? `참석자 명단: ${context.attendeeNames.join(', ')}. 회의 안건: ${context.agenda || context.meetingTitle || '일반 회의'}`
-      : `회의 안건: ${context.agenda || context.meetingTitle || '일반 회의'}`;
-
-    // OpenAI audio transcriptions 호출 (Diarization 옵션 포함)
-    const rawResponse: any = await (client.audio.transcriptions as any).create({
+    // 2. OpenAI 오디오 전사 API 호출 (gpt-4o-transcribe-diarize 공식 규격 준수)
+    // 주의: gpt-4o-transcribe-diarize 모델은 response_format: 'diarized_json'을 요구하며,
+    // prompt, timestamp_granularities, temperature 등은 지원하지 않으므로 포함하지 않습니다.
+    // 30초 초과 오디오 처리를 위해 chunking_strategy: 'auto'를 지정합니다.
+    const requestPayload: any = {
       file,
       model: modelName,
-      response_format: 'verbose_json',
-      prompt: promptHint,
+      response_format: 'diarized_json',
+      chunking_strategy: 'auto',
+    };
+
+    console.log('[transcription] OpenAI model:', modelName);
+    console.log('[transcription] Calling client.audio.transcriptions.create with:', {
+      model: modelName,
+      fileName,
+      mimeType: normalizedMime,
+      fileSizeBytes: audioBuffer.length,
+      response_format: requestPayload.response_format,
+      chunking_strategy: requestPayload.chunking_strategy,
     });
+
+    const rawResponse: any = await (client.audio.transcriptions as any).create(requestPayload);
 
     console.log('[transcription] OpenAI success');
 
@@ -296,11 +310,16 @@ export async function transcribeAudioWithOpenAI(
       transcripts,
     };
   } catch (err: any) {
-    const errorMessage = err?.message || String(err);
+    const errorBody = err?.error || err?.response?.data?.error || {};
+    const errorMessage = errorBody.message || err?.message || String(err);
+    const errorCode = errorBody.code || err?.code || 'OPENAI_ERROR';
+    const errorType = errorBody.type || err?.type || 'api_error';
     const status = err?.status || err?.statusCode || 500;
 
     console.error('[transcription] OpenAI failure:', {
       status,
+      errorCode,
+      errorType,
       errorMessage,
       model: modelName,
       fileSizeBytes: audioBuffer.length,
@@ -309,6 +328,9 @@ export async function transcribeAudioWithOpenAI(
     // 4. 에러 분류 (401/403: 설정 오류, 400: 요청 오류, 429/5xx: Fallback 대상 일시 장애)
     const openAiError: any = new Error(errorMessage);
     openAiError.statusCode = status;
+    openAiError.errorCode = errorCode;
+    openAiError.errorType = errorType;
+    openAiError.detail = errorMessage;
     openAiError.originalError = err;
 
     if (status === 401 || status === 403) {

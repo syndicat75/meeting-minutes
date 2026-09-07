@@ -463,6 +463,57 @@ AI 일괄 전사 요청 (동시 2개 청크 제한 워커 풀로 순차/병렬 �
    - 관리자 진단 영역에 `storage/unauthorized`, `HTTP 403`, `storagePath`를 모노스페이스 폰트로 정밀하게 표시.
    - `localStorage override`가 활성화된 경우 원클릭 [기본 설정으로 초기화] 버튼을 제공하여 프로젝트 불일치를 신속히 해소.
 
+---
+
+## 12. AI 화자 분리 전사 파이프라인 및 HTTP 400 원인 분석 및 해결 아키텍처 (Transcription HTTP 400 Diagnostics & Diarization Pipeline)
+
+### 12.1. HTTP 400 (Bad Request) 근본 원인 분석
+장시간 회의 청크 전사 과정에서 발생한 `POST /api/ai/transcribe-chunk HTTP 400` 오류는 다음과 같은 원인에 의해 발생했습니다:
+1. **OpenAI `gpt-4o-transcribe-diarize` 모델의 `response_format` 불일치 (핵심 원인)**:
+   - 기존 Whisper-1 모델에서 사용하는 `response_format: 'verbose_json'`은 `gpt-4o-transcribe-diarize` 모델에서 지원되지 않으며, 호출 시 OpenAI API가 즉시 `HTTP 400 Bad Request`를 반환합니다.
+   - `gpt-4o-transcribe-diarize` 모델에서 화자 분리(Diarization)를 취득하기 위한 공식 규격은 **`response_format: 'diarized_json'`**입니다.
+2. **미지원 파라미터 전달 (`prompt` 등)**:
+   - `gpt-4o-transcribe-diarize` 모델은 컨텍스트 힌트용 `prompt`, `temperature`, `timestamp_granularities`, `logprobs` 파라미터를 지원하지 않습니다. 이전 코드에서 `prompt`를 함께 전달하여 400 에러를 유발했습니다.
+3. **30초 초과 청크 오디오의 `chunking_strategy` 필수 지정**:
+   - 5분 단위 오디오 청크를 처리할 때 `chunking_strategy: 'auto'`를 명시하여 서버 VAD 기반 청킹이 올바르게 수행되도록 구성해야 합니다.
+4. **서버 측 Firestore 청크 상태 및 스토리지 파일 무결성 사전 검증 부재**:
+   - 클라이언트가 전달한 경로만 신뢰할 경우 업로드가 미완료된 상태(`uploadStatus !== 'uploaded'`)이거나 0바이트 빈 파일인 상태에서 전사를 요청하여 연쇄 400 오류가 발생할 수 있었습니다.
+
+### 12.2. 구현된 아키텍처 및 해결 조치
+1. **OpenAI Diarization API 공식 스펙 준수 (`server/ai/openaiTranscription.ts`)**:
+   - 모델: `SERVER_CONFIG.openaiTranscribeModel` (`gpt-4o-transcribe-diarize`)
+   - 응답 포맷: `response_format: 'diarized_json'` 적용
+   - VAD 전략: `chunking_strategy: 'auto'` 적용
+   - 미지원 파라미터 완전 제거: `prompt`, `temperature`, `timestamp_granularities` 일절 배제
+   - MIME 정규화: `audio/webm;codecs=opus`를 `audio/webm`으로 안전하게 정규화하고 파일명(`chunk_0001.webm`)을 `toFile()` 객체로 전송
+2. **서버 측 Firestore 청크 상태 사전 조회 (`server/storage.ts` & `server/routes.ts`)**:
+   - 클라이언트 입력값(`meetingId`, `chunkId`) 검증 후 Firestore `meetings/{meetingId}/audioChunks/{chunkId}` 문서를 직접 조회.
+   - `uploadStatus !== 'uploaded'`인 경우 OpenAI를 호출하지 않고 즉시 400 JSON 반환.
+   - 스토리지에서 다운로드된 바이너리 크기를 검증하고, 0바이트인 경우 `EMPTY_AUDIO_FILE` 에러로 신속 격리.
+3. **정밀 서버 진단 로깅 체계 구축**:
+   - 장애 발생 시 다음 진단 로그를 완비 (단, `OPENAI_API_KEY`, ID 토큰 등 민감 정보는 절대 배제):
+     ```ts
+     console.error('[transcribe-chunk]', {
+       status,
+       errorCode,
+       errorMessage,
+       meetingId,
+       chunkId,
+       storagePath,
+       model,
+       fileName,
+       mimeType,
+       fileSize
+     });
+     ```
+4. **에러 분류 및 Fallback 차단 정책 (`server/ai/transcriptionService.ts`)**:
+   - 400 (Bad Request), 401/403 (인증/권한) 오류는 잘못된 요청이므로 Gemini로 자동 Fallback하지 않고 근본 원인을 명확한 JSON으로 반환.
+   - 429 (Rate Limit), 5xx (서버 오류), 타임아웃/네트워크 오류만 Gemini Fallback 대상으로 지정.
+5. **Firestore 전사 상태 자동 동기화**:
+   - 전사 성공 시 `transcriptionStatus = 'completed'` 및 `transcriptionCompletedAt`을 Firestore에 기록.
+   - 전사 실패 시 `transcriptionStatus = 'failed'` 및 `errorMessage`를 기록하여 추후 개별 재시도가 가능하도록 보장.
+
+
 
 
 

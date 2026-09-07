@@ -14,7 +14,11 @@ import {
   verifyMeetingAccess,
   AuthenticatedRequest,
 } from './auth.js';
-import { downloadMeetingAudioFromStorage } from './storage.js';
+import {
+  downloadMeetingAudioFromStorage,
+  fetchChunkMetadataFromFirestore,
+  updateChunkStatusInFirestore,
+} from './storage.js';
 import { summarizeMeetingWithGemini } from './gemini.js';
 import { executeTranscription } from './ai/transcriptionService.js';
 import { generateMeetingSummary } from './ai/meetingSummaryService.js';
@@ -390,7 +394,7 @@ apiRouter.post(
       const user = await verifyFirebaseIdToken(token);
       req.user = user;
 
-      // 2. 파라미터 파싱
+      // 2. 파라미터 파싱 및 필수값 검증
       const meetingId = String(req.body.meetingId || '').trim();
       const chunkId = String(req.body.chunkId || '').trim();
       const chunkIndex = typeof req.body.chunkIndex === 'number' ? req.body.chunkIndex : 0;
@@ -411,11 +415,23 @@ apiRouter.post(
         }
       }
 
-      if (!meetingId || !chunkId) {
+      if (!meetingId) {
+        console.warn('[ROUTES] Missing meetingId in /api/ai/transcribe-chunk request');
         return res.status(400).json({
           success: false,
-          error: 'meetingId와 chunkId는 필수 항목입니다.',
-          detail: 'MISSING_PARAMETERS',
+          provider: 'openai',
+          error: 'meetingId가 누락되었습니다.',
+          code: 'MISSING_MEETING_ID',
+        });
+      }
+
+      if (!chunkId) {
+        console.warn('[ROUTES] Missing chunkId in /api/ai/transcribe-chunk request');
+        return res.status(400).json({
+          success: false,
+          provider: 'openai',
+          error: 'chunkId가 누락되었습니다.',
+          code: 'MISSING_CHUNK_ID',
         });
       }
 
@@ -424,28 +440,85 @@ apiRouter.post(
       if (!hasAccess) {
         return res.status(403).json({
           success: false,
+          provider: 'openai',
+          chunkId,
           error: '해당 회의록에 대한 권한이 없습니다.',
-          detail: 'FORBIDDEN',
+          code: 'FORBIDDEN',
         });
       }
 
-      // 4. 스토리지 경로 결정 및 검증
-      let audioStoragePath = req.body.audioStoragePath ? String(req.body.audioStoragePath).trim() : '';
+      // 4. Firestore에서 실제 Chunk 정보 조회 (스토리지 경로 변조 방지 및 업로드 상태 검증)
+      const chunkMeta = await fetchChunkMetadataFromFirestore(meetingId, chunkId, token);
+      let audioStoragePath = chunkMeta?.storagePath || (req.body.audioStoragePath ? String(req.body.audioStoragePath).trim() : '');
       if (!audioStoragePath) {
         audioStoragePath = `meetings/${meetingId}/audio/chunks/${chunkId}.webm`;
+      }
+      const audioUrl = chunkMeta?.downloadUrl || req.body.audioUrl;
+
+      // Firestore의 업로드 상태 검증: uploadStatus !== "uploaded"이면 전사하지 않음
+      if (chunkMeta && chunkMeta.uploadStatus && chunkMeta.uploadStatus !== 'uploaded') {
+        console.error('[transcribe-chunk]', {
+          status: 400,
+          errorCode: 'CHUNK_NOT_UPLOADED',
+          errorMessage: `오디오 청크가 아직 Storage에 업로드 완료되지 않았습니다 (현재 상태: ${chunkMeta.uploadStatus}).`,
+          meetingId,
+          chunkId,
+          storagePath: audioStoragePath,
+          model: SERVER_CONFIG.openaiTranscribeModel,
+          fileName: `${chunkId}.webm`,
+          mimeType: chunkMeta.mimeType || 'audio/webm',
+          fileSize: chunkMeta.size || 0,
+        });
+        return res.status(400).json({
+          success: false,
+          provider: 'openai',
+          chunkId,
+          error: '오디오 청크가 아직 Storage에 업로드 완료되지 않았습니다.',
+          code: 'CHUNK_NOT_UPLOADED',
+          detail: `uploadStatus is ${chunkMeta.uploadStatus}`,
+        });
       }
 
       console.log('[ROUTES] Downloading chunk from storage', { meetingId, chunkId, audioStoragePath });
 
-      // 5. Firebase Storage에서 오디오 다운로드
+      // 5. Firebase Storage에서 오디오 파일 실제 다운로드
       const downloaded = await downloadMeetingAudioFromStorage(
         meetingId,
         audioStoragePath,
-        req.body.audioUrl,
+        audioUrl,
         token
       );
 
-      // 6. 전사 파이프라인 호출 (OpenAI 우선 + Gemini Fallback)
+      // 파일 다운로드 크기 및 버퍼 유효성 확인
+      console.log('[transcribe-chunk:file]', {
+        storagePath: audioStoragePath,
+        size: downloaded.buffer.length,
+      });
+
+      if (!downloaded.buffer || downloaded.buffer.length === 0) {
+        console.error('[transcribe-chunk]', {
+          status: 400,
+          errorCode: 'EMPTY_AUDIO_FILE',
+          errorMessage: '스토리지의 오디오 파일 크기가 0 바이트입니다.',
+          meetingId,
+          chunkId,
+          storagePath: audioStoragePath,
+          model: SERVER_CONFIG.openaiTranscribeModel,
+          fileName: `${chunkId}.webm`,
+          mimeType: downloaded.mimeType,
+          fileSize: 0,
+        });
+        return res.status(400).json({
+          success: false,
+          provider: 'openai',
+          chunkId,
+          error: '스토리지의 오디오 파일 크기가 0 바이트입니다.',
+          code: 'EMPTY_AUDIO_FILE',
+          detail: 'AUDIO_BUFFER_EMPTY',
+        });
+      }
+
+      // 6. 전사 파이프라인 호출 (gpt-4o-transcribe-diarize 공식 규격 준수)
       const result = await executeTranscription(downloaded.buffer, downloaded.mimeType, {
         meetingId,
         meetingTitle,
@@ -461,26 +534,57 @@ apiRouter.post(
         segmentCount: result.transcripts.length,
       });
 
+      // 7. Firestore 전사 상태를 'completed'로 업데이트 (비동기)
+      updateChunkStatusInFirestore(meetingId, chunkId, 'completed', token);
+
       return res.json({
         success: true,
+        provider: result.provider,
         chunkId,
         chunkIndex,
-        provider: result.provider,
         fallbackUsed: result.fallbackUsed,
         speakers: result.speakers,
         fullTranscript: result.fullTranscript,
+        text: result.fullTranscript,
+        segments: result.transcripts,
         transcripts: result.transcripts,
         startSeconds,
         endSeconds,
       });
     } catch (err: any) {
-      console.error('[ROUTES] POST /api/ai/transcribe-chunk failed', err);
-      const statusCode = err.statusCode || 500;
-      return res.status(statusCode).json({
-        success: false,
+      const status = err.statusCode || err.status || 500;
+      const errorCode = err.errorCode || err.code || 'TRANSCRIPTION_FAILED';
+      const errorMessage = err.userMessage || err.message || '청크 음성 전사 중 오류가 발생했습니다.';
+      const detail = err.detail || err.details || String(err);
+
+      console.error('[transcribe-chunk]', {
+        status,
+        errorCode,
+        errorMessage,
+        meetingId: req.body?.meetingId,
         chunkId: req.body?.chunkId,
-        error: err.userMessage || err.message || '청크 음성 전사 중 오류가 발생했습니다.',
-        detail: err.detail || err.details || err.code || String(err),
+        storagePath: req.body?.audioStoragePath || `meetings/${req.body?.meetingId}/audio/chunks/${req.body?.chunkId}.webm`,
+        model: SERVER_CONFIG.openaiTranscribeModel,
+        fileName: `${req.body?.chunkId || 'chunk'}.webm`,
+        mimeType: 'audio/webm',
+        fileSize: 0,
+      });
+
+      // Firestore 전사 상태를 'failed'로 기록 (비동기)
+      const reqMeetingId = req.body?.meetingId;
+      const reqChunkId = req.body?.chunkId;
+      const token = extractBearerToken(req.headers.authorization);
+      if (token && reqMeetingId && reqChunkId) {
+        updateChunkStatusInFirestore(reqMeetingId, reqChunkId, 'failed', token, errorMessage);
+      }
+
+      return res.status(status).json({
+        success: false,
+        provider: 'openai',
+        chunkId: req.body?.chunkId,
+        error: errorMessage,
+        code: errorCode,
+        detail,
       });
     }
   }

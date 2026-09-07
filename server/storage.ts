@@ -138,3 +138,126 @@ export async function downloadMeetingAudioFromStorage(
     sizeBytes: buffer.length,
   };
 }
+
+/**
+ * Firestore 청크 메타데이터 인터페이스
+ */
+export interface FirestoreChunkMetadata {
+  chunkId: string;
+  storagePath: string;
+  mimeType: string;
+  size: number;
+  uploadStatus: string;
+  downloadUrl?: string;
+  transcriptionStatus?: string;
+}
+
+/**
+ * Firestore meetings/{meetingId}/audioChunks/{chunkId}에서 실제 청크 메타데이터 조회
+ * 클라이언트가 storagePath를 임의 지정하지 못하도록 서버가 직접 Firestore 문서를 검증합니다.
+ * @param {string} meetingId 회의 ID
+ * @param {string} chunkId 청크 ID
+ * @param {string} idToken 사용자 인증 토큰
+ * @returns {Promise<FirestoreChunkMetadata | null>} 청크 메타데이터 또는 null
+ */
+export async function fetchChunkMetadataFromFirestore(
+  meetingId: string,
+  chunkId: string,
+  idToken: string
+): Promise<FirestoreChunkMetadata | null> {
+  console.log('[STORAGE] fetchChunkMetadataFromFirestore called', { meetingId, chunkId });
+  const { firebaseProjectId } = getServerEnv();
+  if (!firebaseProjectId || !idToken) return null;
+
+  try {
+    const docUrl = `https://firestore.googleapis.com/v1/projects/${firebaseProjectId}/databases/(default)/documents/meetings/${meetingId}/audioChunks/${chunkId}`;
+    const response = await fetch(docUrl, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+
+    if (!response.ok) {
+      console.warn('[STORAGE] Failed to fetch chunk from Firestore REST', { status: response.status });
+      return null;
+    }
+
+    const docData = await response.json();
+    const fields = docData.fields || {};
+
+    const storagePath = fields.storagePath?.stringValue || '';
+    const mimeType = fields.mimeType?.stringValue || 'audio/webm';
+    const size = Number(fields.size?.integerValue || fields.fileSize?.integerValue || 0);
+    const uploadStatus = fields.uploadStatus?.stringValue || 'unknown';
+    const downloadUrl = fields.downloadUrl?.stringValue || '';
+    const transcriptionStatus = fields.transcriptionStatus?.stringValue || 'idle';
+
+    console.log('[STORAGE] Retrieved chunk metadata from Firestore', {
+      chunkId,
+      storagePath,
+      uploadStatus,
+      size,
+    });
+
+    return {
+      chunkId,
+      storagePath,
+      mimeType,
+      size,
+      uploadStatus,
+      downloadUrl,
+      transcriptionStatus,
+    };
+  } catch (err: any) {
+    console.error('[STORAGE] Error querying chunk from Firestore REST:', err.message);
+    return null;
+  }
+}
+
+/**
+ * 전사 완료/실패 상태를 Firestore REST API를 통해 업데이트
+ * @param {string} meetingId 회의 ID
+ * @param {string} chunkId 청크 ID
+ * @param {'completed' | 'failed'} status 전사 상태
+ * @param {string} idToken 사용자 인증 토큰
+ * @param {string} [errorMessage] 에러 메시지 (실패 시)
+ * @returns {Promise<void>}
+ */
+export async function updateChunkStatusInFirestore(
+  meetingId: string,
+  chunkId: string,
+  status: 'completed' | 'failed',
+  idToken: string,
+  errorMessage?: string
+): Promise<void> {
+  console.log('[STORAGE] updateChunkStatusInFirestore called', { meetingId, chunkId, status });
+  const { firebaseProjectId } = getServerEnv();
+  if (!firebaseProjectId || !idToken) return;
+
+  try {
+    const docUrl = `https://firestore.googleapis.com/v1/projects/${firebaseProjectId}/databases/(default)/documents/meetings/${meetingId}/audioChunks/${chunkId}?updateMask.fieldPaths=transcriptionStatus&updateMask.fieldPaths=transcriptionCompletedAt${errorMessage ? '&updateMask.fieldPaths=errorMessage' : ''}`;
+
+    const fields: Record<string, any> = {
+      transcriptionStatus: { stringValue: status },
+      transcriptionCompletedAt: { stringValue: new Date().toISOString() },
+    };
+    if (errorMessage) {
+      fields.errorMessage = { stringValue: errorMessage };
+    }
+
+    const response = await fetch(docUrl, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fields }),
+    });
+
+    if (!response.ok) {
+      console.warn('[STORAGE] Failed to patch chunk status in Firestore REST', { status: response.status });
+    } else {
+      console.log('[STORAGE] Successfully updated chunk status in Firestore', { chunkId, status });
+    }
+  } catch (err: any) {
+    console.warn('[STORAGE] Failed to update chunk status in Firestore REST', err.message);
+  }
+}
