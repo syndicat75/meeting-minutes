@@ -4,8 +4,8 @@
  * 임의 URL 호출(SSRF)을 엄격히 차단하고, 허가된 회의 스토리지 경로(meetings/{meetingId}/recordings/*)만 처리합니다.
  */
 
-import { getServerEnv, SERVER_CONFIG } from './config';
-import { isValidMeetingStoragePath } from './auth';
+import { getServerEnv, SERVER_CONFIG } from './config.js';
+import { isValidMeetingStoragePath } from './auth.js';
 
 /**
  * 스토리지에서 다운로드된 오디오 데이터 객체

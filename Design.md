@@ -232,4 +232,17 @@ Vercel에서 Vite SPA 화면과 Express 백엔드 API를 동시에 배포할 때
    - 전사 버튼은 로딩 상태 해제 후 즉시 활성화되어 재시도가 가능합니다.
    - 전사 진행 중에는 스피너와 함께 "AI가 회의 음성을 분석하고 있습니다..." 배너 및 버튼 disabled 처리를 적용하여 중복 요청을 방지합니다.
 
+### 8.8. Vercel Serverless Function ES Module Import 구조 및 번들링 최적화
+1. **ESM 상대 경로 확장자 명시**:
+   - `package.json`의 `"type": "module"` 환경에 맞춰, Node.js 런타임이 상대 경로를 로드할 때 `ERR_MODULE_NOT_FOUND`가 발생하지 않도록 모든 서버 모듈 import에 명시적인 `.js` 확장자를 사용합니다 (TypeScript ESM 표준 규격).
+   - `api/index.ts`: `import app from '../server/app.js'; export default app;`
+   - `server/app.ts`: `import { apiRouter } from './routes.js';`
+   - `server/routes.ts`, `server/auth.ts`, `server/storage.ts`, `server/gemini.ts`, `server.ts`: 모든 로컬 모듈 import에 `.js` 확장자 명시
+2. **Vercel Functions 번들링 및 파일 포함 (`vercel.json`)**:
+   - `functions["api/index.ts"]`에 `"includeFiles": "server/**"`를 구성하여 서버 모듈이 Vercel 빌드 아티팩트 `/var/task/`에 누락 없이 안전하게 포함되도록 보장합니다.
+3. **API 진입점 라우팅 일관성**:
+   - `vercel.json`의 rewrites (`/api/(.*)` -> `/api`)를 통해 모든 API 요청이 단일 Express 진입점인 `api/index.ts`로 수렴됩니다.
+   - `GET /api` 및 `GET /`에 대한 루트 안내 엔드포인트를 제공하여 모듈 로딩 및 헬스 상태를 즉각 진단할 수 있습니다.
+
+
 

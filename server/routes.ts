@@ -7,18 +7,18 @@
 
 import express, { Request, Response } from 'express';
 import multer from 'multer';
-import { getServerEnv, SERVER_CONFIG } from './config';
+import { getServerEnv, SERVER_CONFIG } from './config.js';
 import {
   extractBearerToken,
   verifyFirebaseIdToken,
   verifyMeetingAccess,
   AuthenticatedRequest,
-} from './auth';
-import { downloadMeetingAudioFromStorage } from './storage';
+} from './auth.js';
+import { downloadMeetingAudioFromStorage } from './storage.js';
 import {
   transcribeAudioWithGemini,
   summarizeMeetingWithGemini,
-} from './gemini';
+} from './gemini.js';
 
 export const apiRouter = express.Router();
 
@@ -26,6 +26,20 @@ export const apiRouter = express.Router();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: SERVER_CONFIG.directUploadLimitBytes },
+});
+
+/**
+ * API 루트 엔드포인트: GET /api 또는 GET /
+ * Vercel Function 및 API 서버 상태 확인
+ */
+apiRouter.get('/', (req: Request, res: Response) => {
+  console.log('[ROUTES] GET / called');
+  res.json({
+    status: 'ok',
+    service: 'ai-meeting-notes-api',
+    message: 'AI 회의록 관리 API 서버가 정상 동작 중입니다.',
+    endpoints: ['/api/health', '/api/ai/transcribe', '/api/ai/summarize'],
+  });
 });
 
 /**

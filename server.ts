@@ -8,8 +8,8 @@ import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
-import { app } from './server/app';
-import { SERVER_CONFIG } from './server/config';
+import { app } from './server/app.js';
+import { SERVER_CONFIG } from './server/config.js';
 
 dotenv.config();
 

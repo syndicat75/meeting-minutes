@@ -5,7 +5,7 @@
  */
 
 import { GoogleGenAI, Type, Schema } from '@google/genai';
-import { getServerEnv, SERVER_CONFIG } from './config';
+import { getServerEnv, SERVER_CONFIG } from './config.js';
 
 /**
  * Gemini 클라이언트 지연 초기화 인스턴스

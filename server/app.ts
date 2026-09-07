@@ -5,7 +5,7 @@
  */
 
 import express, { Request, Response, NextFunction } from 'express';
-import { apiRouter } from './routes';
+import { apiRouter } from './routes.js';
 
 /**
  * Express 애플리케이션 생성 및 설정 함수

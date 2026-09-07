@@ -5,7 +5,7 @@
  */
 
 import { Request, Response, NextFunction } from 'express';
-import { getServerEnv, SERVER_CONFIG } from './config';
+import { getServerEnv, SERVER_CONFIG } from './config.js';
 
 /**
  * 인증된 사용자 정보 인터페이스
