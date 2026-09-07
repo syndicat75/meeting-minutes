@@ -96,63 +96,65 @@ async function fetchWithRetry(
 
 /**
  * 서버 응답 검증 및 진단별 상세 에러 메시지 생성 헬퍼
- * 404(배포 경로/HTML), 401(인증), 403(권한), 503(키 미설정), 500/502(AI 실패)를 엄격히 구분
+ * response.text()로 원본을 수신한 후 안전하게 JSON 파싱을 수행하며,
+ * 401/403(인증), 429(할당량), 400(형식), 413(용량), 503(키/장애), 500(서버 내부)을 명확히 구분합니다.
  * @param {Response} response fetch 응답 객체
  * @param {string} actionName 수행 중인 작업명
  * @returns {Promise<any>} 파싱된 JSON 데이터
  */
 async function parseServerResponse(response: Response, actionName: string): Promise<any> {
-  const contentType = response.headers.get('content-type') || '';
-  const isHtml = contentType.includes('text/html');
+  logger.info('parseServerResponse called', { actionName, status: response.status });
 
-  // 1. 404 Not Found 또는 HTML이 반환된 경우 (Vercel rewrite 누락 또는 SPA index.html 응답)
-  if (response.status === 404 || isHtml) {
-    logger.error('API endpoint returned 404 or HTML', { status: response.status, contentType });
-    throw new Error(
-      `[배포 경로 오류 (404)] 서버 API 엔드포인트(/api/ai/...)를 찾을 수 없거나 SPA HTML이 반환되었습니다. Vercel 배포 시 vercel.json rewrite 설정 및 api/index.ts 서버리스 함수가 정상 배포되었는지 확인하세요.`
-    );
-  }
+  // 1. 먼저 response.text()로 원시 응답을 취득
+  const rawText = await response.text();
 
+  // 2. 안전한 JSON 파싱 시도
   let body: any = null;
   try {
-    body = await response.json();
+    body = JSON.parse(rawText);
   } catch (jsonErr) {
-    logger.error('Failed to parse JSON response', jsonErr);
-    throw new Error(
-      `[응답 파싱 오류] 서버 응답이 올바른 JSON 형식이 아닙니다. (상태 코드: ${response.status})`
-    );
+    // JSON이 아닌 응답인 경우 (예: HTML 또는 일반 텍스트) 개발자 콘솔에 status code와 rawText를 상세 출력
+    console.error(`[API Error] Non-JSON response from server (Status ${response.status}):`, rawText);
+    logger.error('Failed to parse server response as JSON', { status: response.status, rawSnippet: rawText.slice(0, 200) });
+    throw new Error('AI 전사 서버 오류가 발생했습니다.');
   }
 
-  // 2. HTTP 에러 상태별 명확한 분기 처리
-  if (!response.ok) {
-    const errorCode = body?.error || `HTTP_${response.status}`;
-    const errorMsg = body?.message || body?.error || '알 수 없는 서버 오류가 발생했습니다.';
+  // 3. HTTP 실패 또는 서버 명시 실패(success === false) 처리
+  if (!response.ok || body?.success === false) {
+    const errorMsg = body?.error || body?.message || '알 수 없는 오류가 발생했습니다.';
+    const detailMsg = body?.detail || body?.details ? ` (${body?.detail || body?.details})` : '';
 
-    if (response.status === 401 || errorCode === 'UNAUTHORIZED') {
-      throw new Error(
-        `[인증 실패 (401)] 로그인이 필요합니다. AI 음성 전사 및 요약 기능을 사용하려면 먼저 우측 상단에서 Google 계정으로 로그인해주세요.`
-      );
+    console.error(`[API Error] ${actionName} failed with status ${response.status}:`, {
+      error: errorMsg,
+      detail: body?.detail || body?.details,
+      status: response.status,
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(`Gemini API 인증 오류: ${errorMsg}${detailMsg}`);
     }
 
-    if (response.status === 403 || errorCode === 'FORBIDDEN' || errorCode === 'FORBIDDEN_STORAGE_PATH') {
-      throw new Error(
-        `[권한 오류 (403)] ${errorMsg || '해당 회의록에 대한 편집 권한이 없거나 허용되지 않은 스토리지 경로입니다.'}`
-      );
+    if (response.status === 429) {
+      throw new Error(`Gemini API 사용량 또는 할당량 초과: ${errorMsg}${detailMsg}`);
     }
 
-    if (response.status === 503 || errorCode === 'GEMINI_API_KEY_NOT_CONFIGURED') {
-      throw new Error(
-        `[AI 키 미설정 (503)] 서버에 GEMINI_API_KEY 환경변수가 설정되지 않았습니다. Vercel 프로젝트 Settings > Environment Variables 또는 .env에 GEMINI_API_KEY를 등록해주세요.`
-      );
+    if (response.status === 400) {
+      throw new Error(`오디오 또는 Gemini 요청 형식 오류: ${errorMsg}${detailMsg}`);
     }
 
-    if (response.status === 502 || errorCode === 'GEMINI_INFERENCE_ERROR') {
-      throw new Error(
-        `[AI 처리 실패 (502)] Gemini 모델 추론 중 오류: ${errorMsg}`
-      );
+    if (response.status === 413) {
+      throw new Error(`오디오 파일 크기 초과: ${errorMsg}${detailMsg}`);
     }
 
-    throw new Error(`[${actionName} 실패 (코드 ${response.status})] ${errorMsg}`);
+    if (response.status === 503) {
+      throw new Error(`Gemini 서비스 일시 장애 또는 키 미설정: ${errorMsg}${detailMsg}`);
+    }
+
+    if (response.status === 500) {
+      throw new Error(`서버 내부 오류: ${errorMsg}${detailMsg}`);
+    }
+
+    throw new Error(`${errorMsg}${detailMsg}`);
   }
 
   return body;
@@ -205,15 +207,13 @@ export async function requestTranscription(
   if (payload.agenda) formData.append('agenda', payload.agenda);
   if (payload.attendeeNames) formData.append('attendeeNames', JSON.stringify(payload.attendeeNames));
 
-  // Storage 경로가 없고 직접 오디오 Blob만 존재하는 경우에만 첨부
-  // Vercel Serverless 요청 본문 제한(4.5MB) 체크
-  if (!payload.audioStoragePath && payload.audioBlob) {
-    if (payload.audioBlob.size > 4.5 * 1024 * 1024) {
-      throw new Error(
-        '4.5MB를 초과하는 대용량 오디오는 Vercel 요청 본문 한도를 초과할 수 있습니다. 먼저 [녹음 완료 및 스토리지 저장]을 진행해주세요.'
-      );
-    }
+  // 오디오 Blob이 존재하는 경우 직접 업로드용 audioFile로 항상 첨부 (Vercel 및 로컬 서버에서 최우선으로 즉시 처리)
+  if (payload.audioBlob && payload.audioBlob.size <= 45 * 1024 * 1024) {
     formData.append('audioFile', payload.audioBlob, 'recording.webm');
+  } else if (!payload.audioStoragePath && payload.audioBlob && payload.audioBlob.size > 45 * 1024 * 1024) {
+    throw new Error(
+      '파일 크기(45MB 초과)가 너무 큽니다. 오디오 파일을 압축하거나 분할하여 업로드해주세요.'
+    );
   }
 
   try {
@@ -224,8 +224,11 @@ export async function requestTranscription(
     });
 
     const data = await parseServerResponse(response, 'AI 음성 전사');
-    logger.info('Transcription response received', { segmentCount: data.transcripts?.length });
-    return data.transcripts as TranscriptSegment[];
+    logger.info('Transcription response received', {
+      segmentCount: data.transcripts?.length,
+      speakerCount: data.speakers?.length,
+    });
+    return (data.transcripts || []) as TranscriptSegment[];
   } catch (err: any) {
     logger.error('requestTranscription failed', { error: err?.message });
     throw err;

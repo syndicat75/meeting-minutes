@@ -216,4 +216,20 @@ Vercel에서 Vite SPA 화면과 Express 백엔드 API를 동시에 배포할 때
 - `GET /api/health` 호출 시 비밀키 노출 없이 서버 동작 여부, Gemini 키 설정 유무(`geminiConfigured`), Firebase 설정 유무(`firebaseConfigured`), 모델명, 용량 한도를 JSON으로 제공합니다.
 - 프런트엔드는 404(배포 경로 오류/HTML 응답), 401(미로그인 인증 필요), 403(권한 오류), 503(키 미설정), 500/502(AI 처리 실패)를 시각적으로 명확히 분기하여 사용자에게 표시하며, 404 오류 시 무한 반복 재시도를 수행하지 않습니다.
 
+### 8.7. 엄격한 JSON 응답 보장 및 프론트엔드 내결함성 (Fault Tolerance)
+1. **서버 응답 표준화 (`{ success, transcript, speakers, fullTranscript, summary, error, detail }`)**:
+   - 성공 시: `{ success: true, transcript, speakers, fullTranscript, summary, transcripts }`
+   - 실패 시: `{ success: false, error: "사용자 친화적 메시지", detail: "상세 원인" }`
+   - Express 전역 에러 핸들러 및 라우터에서 어떤 예외가 발생하더라도 HTML이 아닌 유효한 JSON으로만 응답합니다.
+2. **사전 검증 (Fail Fast)**:
+   - 서버 진입 시 `GEMINI_API_KEY` 설정 여부를 먼저 확인하여, 누락 시 모델을 호출하지 않고 HTTP 503 JSON 응답을 즉시 반환합니다.
+3. **오디오 버퍼 처리 우선순위**:
+   - 직접 전송된 `audioFile` 버퍼가 존재하면 스토리지 원격 조회 없이 메모리에서 즉시 Gemini로 분석하여 안정성과 속도를 극대화합니다.
+   - `audio/webm;codecs=opus` 등 확장 MIME 타입을 표준 `audio/webm`으로 정규화하여 Gemini API에 전달합니다.
+4. **프론트엔드 상태 보존 및 복구**:
+   - `response.text()` 수신 후 JSON 파싱을 시도하며, 파싱 실패 시 개발자 콘솔에 status code와 rawText를 기록하고 사용자에게 정돈된 안내를 표시합니다.
+   - 500 등 오류 발생 시에도 기존 녹음 데이터, 재생 기능, 다운로드 버튼이 전혀 훼손되지 않고 그대로 유지됩니다.
+   - 전사 버튼은 로딩 상태 해제 후 즉시 활성화되어 재시도가 가능합니다.
+   - 전사 진행 중에는 스피너와 함께 "AI가 회의 음성을 분석하고 있습니다..." 배너 및 버튼 disabled 처리를 적용하여 중복 요청을 방지합니다.
+
 

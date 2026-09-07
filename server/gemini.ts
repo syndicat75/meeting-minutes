@@ -23,9 +23,7 @@ export function getGeminiClient(): GoogleGenAI {
 
   if (!geminiApiKey || geminiApiKey.trim() === '' || geminiApiKey === 'MY_GEMINI_API_KEY') {
     console.error('[GEMINI] GEMINI_API_KEY is not set or placeholder');
-    const error: any = new Error(
-      '서버에 GEMINI_API_KEY 환경변수가 설정되지 않았습니다. Vercel 프로젝트 Settings > Environment Variables 또는 .env에 유효한 GEMINI_API_KEY를 등록해주세요.'
-    );
+    const error: any = new Error('GEMINI_API_KEY가 서버에 설정되어 있지 않습니다.');
     error.statusCode = 503;
     error.code = 'GEMINI_API_KEY_NOT_CONFIGURED';
     throw error;
@@ -39,7 +37,17 @@ export function getGeminiClient(): GoogleGenAI {
 }
 
 /**
- * 대화록 세그먼트 인터페이스
+ * 화자별 대화 항목 인터페이스
+ */
+export interface TranscriptionSpeakerItem {
+  speaker: string;
+  startTime?: string;
+  endTime?: string;
+  text: string;
+}
+
+/**
+ * 기존 대화록 세그먼트 인터페이스 (UI 호환용)
  */
 export interface TranscriptSegment {
   id: string;
@@ -51,11 +59,42 @@ export interface TranscriptSegment {
 }
 
 /**
+ * 통합 화자 분리 전사 결과 인터페이스
+ */
+export interface TranscriptionResult {
+  success: boolean;
+  transcript: string;
+  speakers: TranscriptionSpeakerItem[];
+  fullTranscript: string;
+  summary: string;
+  transcripts: TranscriptSegment[];
+}
+
+/**
+ * "MM:SS" 또는 "HH:MM:SS" 타임스탬프 문자열을 초 단위 숫자로 변환하는 헬퍼 함수
+ * @param {string | undefined} timeStr 타임스탬프 문자열
+ * @param {number} fallback 기본 초 단위 값
+ * @returns {number} 초 단위 숫자
+ */
+function parseTimeStringToSeconds(timeStr: string | undefined, fallback: number = 0): number {
+  if (!timeStr) return fallback;
+  const parts = timeStr.trim().split(':').map((p) => parseFloat(p));
+  if (parts.some((p) => isNaN(p))) return fallback;
+
+  if (parts.length === 2) {
+    return Math.round((parts[0] * 60 + parts[1]) * 10) / 10;
+  } else if (parts.length === 3) {
+    return Math.round((parts[0] * 3600 + parts[1] * 60 + parts[2]) * 10) / 10;
+  }
+  return fallback;
+}
+
+/**
  * 음성 버퍼를 Gemini 2.5 Flash 모델로 전송하여 화자별 대화록으로 전사
  * @param {Buffer} audioBuffer 오디오 원시 바이너리 데이터
- * @param {string} mimeType 오디오 MIME 타입 (예: audio/webm, audio/mp4)
+ * @param {string} mimeType 오디오 MIME 타입 (예: audio/webm, audio/webm;codecs=opus)
  * @param {object} meetingContext 회의 컨텍스트 정보 (제목, 안건, 참석자 명단)
- * @returns {Promise<TranscriptSegment[]>} 화자 분리 대화록 배열
+ * @returns {Promise<TranscriptionResult>} 화자 분리 전사 결과 객체
  */
 export async function transcribeAudioWithGemini(
   audioBuffer: Buffer,
@@ -65,10 +104,10 @@ export async function transcribeAudioWithGemini(
     agenda?: string;
     attendeeNames?: string[];
   }
-): Promise<TranscriptSegment[]> {
+): Promise<TranscriptionResult> {
   console.log('[GEMINI] transcribeAudioWithGemini called', {
     bufferBytes: audioBuffer.length,
-    mimeType,
+    rawMimeType: mimeType,
     meetingTitle: meetingContext.meetingTitle,
   });
 
@@ -79,33 +118,60 @@ export async function transcribeAudioWithGemini(
     throw error;
   }
 
+  // 1. MIME 타입 정규화: audio/webm;codecs=opus -> audio/webm
+  const rawMime = mimeType || 'audio/webm';
+  const normalizedMimeType = rawMime.split(';')[0].trim().toLowerCase() || 'audio/webm';
+  console.log('[GEMINI] Normalized MIME type for Gemini inlineData:', normalizedMimeType);
+
   const ai = getGeminiClient();
   const base64Audio = audioBuffer.toString('base64');
 
-  const systemPrompt = `당신은 대한민국 산업안전 및 기업 회의록 전문 음성 전사 AI입니다.
-입력된 회의 음성을 정확하게 청취하고, 화자별 발언 단위(Transcript Segments)로 전사하십시오.
+  const systemPrompt = `당신은 대한민국 산업안전보건 및 기업 회의록 전문 음성 전사 AI입니다.
+입력된 회의 음성을 정확하게 청취하고, 화자 분리 대화록과 전체 전사문, 핵심 요약을 생성하십시오.
 
 [엄격한 처리 규칙]
 1. 실제 음성에 기록된 발언만 전사하십시오. 음성에 없는 대화나 임의의 예시를 지어내거나(환각) 추측하지 마십시오.
-2. 화자는 실제 성명을 임의 확정하지 말고 "speaker_1", "speaker_2", "speaker_3" 형태로 분류하십시오.
-3. 소음, 동시 발화, 발음 불명확으로 확인이 필요한 구간은 needsReview: true로 설정하십시오.
-4. startSeconds와 endSeconds는 음성의 실제 타임스탬프(초 단위 정수 또는 소수점 1자리)로 작성하십시오.
+2. 화자는 "화자 1", "화자 2", "화자 3" 형태로 식별하십시오.
+3. 소음 구간이나 발음 불명확 구간은 무리하게 추측하지 말고 가능한 들리는 대로 정확히 기재하십시오.
+4. startTime과 endTime은 "MM:SS" 형태(예: "00:00", "00:15")로 작성하십시오.
 5. 회의 기본 정보: 제목 "${meetingContext.meetingTitle}", 안건: "${meetingContext.agenda || '일반 안건'}"
 참고 참석자 명단: ${(meetingContext.attendeeNames || []).join(', ') || '미지정'}
 
-반드시 아래 JSON 스키마를 만족하는 순수 JSON 문자열로만 응답하십시오:
+반드시 아래 JSON 스키마를 만족하는 순수 JSON으로 응답하십시오:
 {
-  "transcripts": [
+  "speakers": [
     {
-      "id": "seg_1",
-      "startSeconds": 0,
-      "endSeconds": 15,
-      "speakerId": "speaker_1",
-      "text": "실제 청취된 발언 내용",
-      "needsReview": false
+      "speaker": "화자 1",
+      "startTime": "00:00",
+      "endTime": "00:08",
+      "text": "발언 내용"
     }
-  ]
+  ],
+  "fullTranscript": "전체 회의 내용",
+  "summary": "회의 핵심 요약"
 }`;
+
+  const transcriptionSchema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      speakers: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            speaker: { type: Type.STRING },
+            startTime: { type: Type.STRING },
+            endTime: { type: Type.STRING },
+            text: { type: Type.STRING },
+          },
+          required: ['speaker', 'text'],
+        },
+      },
+      fullTranscript: { type: Type.STRING },
+      summary: { type: Type.STRING },
+    },
+    required: ['speakers', 'fullTranscript', 'summary'],
+  };
 
   try {
     const response = await ai.models.generateContent({
@@ -117,7 +183,7 @@ export async function transcribeAudioWithGemini(
             { text: systemPrompt },
             {
               inlineData: {
-                mimeType: mimeType || 'audio/webm',
+                mimeType: normalizedMimeType,
                 data: base64Audio,
               },
             },
@@ -126,46 +192,127 @@ export async function transcribeAudioWithGemini(
       ],
       config: {
         responseMimeType: 'application/json',
+        responseSchema: transcriptionSchema,
         temperature: 0.1,
       },
     });
 
-    const responseText = response.text || '{}';
+    let responseText = (response.text || '').trim();
+
+    // 마크다운 코드 펜스(```json ... ```) 안전 제거
+    if (responseText.startsWith('```json')) {
+      responseText = responseText.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+    } else if (responseText.startsWith('```')) {
+      responseText = responseText.replace(/^```\s*/, '').replace(/```\s*$/, '').trim();
+    }
+
     let parsed: any;
     try {
       parsed = JSON.parse(responseText);
     } catch (parseErr) {
-      console.error('[GEMINI] Failed to parse JSON response from Gemini', { responseText });
+      console.error('[transcription] Gemini response JSON parse failed. Raw response snippet:', responseText.slice(0, 300));
       const error: any = new Error('Gemini 응답 JSON 파싱 실패: 모델이 유효한 JSON을 반환하지 않았습니다.');
       error.statusCode = 502;
       error.code = 'INVALID_AI_RESPONSE';
       throw error;
     }
 
-    const rawTranscripts = Array.isArray(parsed.transcripts) ? parsed.transcripts : [];
-    if (rawTranscripts.length === 0) {
-      console.warn('[GEMINI] Model returned empty transcript segments');
-    }
+    const rawSpeakers = Array.isArray(parsed.speakers) ? parsed.speakers : [];
+    const fullTranscript = String(parsed.fullTranscript || '').trim() ||
+      rawSpeakers.map((s: any) => `${s.speaker}: ${s.text}`).join('\n');
+    const summary = String(parsed.summary || '').trim();
 
-    // 세그먼트 데이터 정규화
-    const transcripts: TranscriptSegment[] = rawTranscripts.map((item: any, idx: number) => ({
-      id: item.id || `seg_${idx + 1}`,
-      startSeconds: typeof item.startSeconds === 'number' ? item.startSeconds : 0,
-      endSeconds: typeof item.endSeconds === 'number' ? item.endSeconds : 0,
-      speakerId: item.speakerId || 'speaker_1',
-      text: String(item.text || '').trim(),
-      needsReview: Boolean(item.needsReview),
+    const speakers: TranscriptionSpeakerItem[] = rawSpeakers.map((s: any, idx: number) => ({
+      speaker: s.speaker || `화자 ${idx + 1}`,
+      startTime: s.startTime || '00:00',
+      endTime: s.endTime || '00:00',
+      text: String(s.text || '').trim(),
     }));
 
-    console.log('[GEMINI] Audio transcription successful', { segmentCount: transcripts.length });
-    return transcripts;
+    // 기존 프론트엔드 호환용 transcripts 세그먼트 생성
+    let currentSeconds = 0;
+    const transcripts: TranscriptSegment[] = speakers.map((s, idx) => {
+      const start = parseTimeStringToSeconds(s.startTime, currentSeconds);
+      const end = parseTimeStringToSeconds(s.endTime, start + 5);
+      currentSeconds = end;
+
+      // speaker_1, speaker_2 형태로 ID 규격화
+      const speakerNumMatch = s.speaker.match(/\d+/);
+      const speakerId = speakerNumMatch ? `speaker_${speakerNumMatch[0]}` : `speaker_${idx + 1}`;
+
+      return {
+        id: `seg_${idx + 1}`,
+        startSeconds: start,
+        endSeconds: end,
+        speakerId,
+        text: s.text,
+        needsReview: false,
+      };
+    });
+
+    console.log('[transcription] Audio transcription successful', {
+      speakerCount: speakers.length,
+      fullTranscriptLength: fullTranscript.length,
+    });
+
+    return {
+      success: true,
+      transcript: fullTranscript,
+      speakers,
+      fullTranscript,
+      summary,
+      transcripts,
+    };
   } catch (err: any) {
-    if (err.statusCode) throw err;
-    console.error('[GEMINI] Audio transcription API error', err);
-    const error: any = new Error(`Gemini AI 음성 전사 처리 실패: ${err?.message || '알 수 없는 오류'}`);
-    error.statusCode = 502;
+    if (err.statusCode && err.code === 'GEMINI_API_KEY_NOT_CONFIGURED') {
+      throw err;
+    }
+
+    // 3. Gemini API 오류 원인을 지정된 형식으로 서버 로그에 상세 출력
+    console.error('[transcription] Gemini API error', err);
+
+    const httpStatus =
+      err?.status ||
+      err?.statusCode ||
+      err?.response?.status ||
+      (err?.message?.includes('429') ? 429 : 500);
+
+    const errorMessage = err?.message || String(err);
+
+    console.error('[transcription] Diagnostics:', {
+      model: SERVER_CONFIG.geminiModel,
+      mimeType: normalizedMimeType,
+      fileSizeBytes: audioBuffer.length,
+      httpStatus,
+      errorMessage,
+    });
+
+    let mappedStatusCode = 500;
+    let userErrorMessage = 'AI 음성 전사 처리 중 서버 오류가 발생했습니다.';
+
+    if (httpStatus === 401 || httpStatus === 403) {
+      mappedStatusCode = 401;
+      userErrorMessage = 'Gemini API 인증 오류가 발생했습니다. 서버 API Key를 확인해주세요.';
+    } else if (httpStatus === 429) {
+      mappedStatusCode = 429;
+      userErrorMessage = 'Gemini API 사용량 또는 분당 요청 한도(Quota)가 초과되었습니다. 잠시 후 다시 시도해주세요.';
+    } else if (httpStatus === 400) {
+      mappedStatusCode = 400;
+      userErrorMessage = '오디오 또는 Gemini 요청 형식 오류가 발생했습니다.';
+    } else if (httpStatus === 413) {
+      mappedStatusCode = 413;
+      userErrorMessage = '오디오 파일 크기가 허용 한도를 초과했습니다.';
+    } else if (httpStatus === 503) {
+      mappedStatusCode = 503;
+      userErrorMessage = 'Gemini 서비스에 일시적인 장애가 발생했습니다. 잠시 후 다시 시도해주세요.';
+    } else {
+      userErrorMessage = `Gemini 모델 추론 오류: ${errorMessage}`;
+    }
+
+    const error: any = new Error(userErrorMessage);
+    error.statusCode = mappedStatusCode;
     error.code = 'GEMINI_INFERENCE_ERROR';
-    error.details = String(err);
+    error.detail = errorMessage;
     throw error;
   }
 }
@@ -331,7 +478,23 @@ ${formattedTranscript}
       },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    let responseText = (response.text || '{}').trim();
+    if (responseText.startsWith('```json')) {
+      responseText = responseText.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+    } else if (responseText.startsWith('```')) {
+      responseText = responseText.replace(/^```\s*/, '').replace(/```\s*$/, '').trim();
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch (parseErr) {
+      console.error('[summarize] Gemini response JSON parse failed. Raw response snippet:', responseText.slice(0, 300));
+      const error: any = new Error('Gemini 요약 응답 JSON 파싱 실패');
+      error.statusCode = 502;
+      error.code = 'INVALID_AI_RESPONSE';
+      throw error;
+    }
     const resultSummary = {
       ...parsed,
       generatedAt: new Date().toISOString(),

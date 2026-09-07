@@ -64,6 +64,8 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
   // AI 전사 처리 상태
   const [isTranscribing, setIsTranscribing] = useState<boolean>(false);
   const [transcribeError, setTranscribeError] = useState<string | null>(null);
+  // 전사 직접 전송을 위한 현재 세션 오디오 Blob 보관
+  const [currentAudioBlob, setCurrentAudioBlob] = useState<Blob | null>(null);
 
   // 녹음 인스턴스 참조
   const recorderRef = useRef<BrowserAudioRecorder | null>(null);
@@ -142,6 +144,9 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
     setUploadPercent(0);
 
     try {
+      // 녹음 직후 생성된 오디오 Blob을 세션 상태에 즉시 보관
+      setCurrentAudioBlob(result.blob);
+
       // 1. Storage 업로드 (또는 오프라인 로컬 URL 생성)
       const uploadRes = await uploadRecordingAudio(
         meeting.id,
@@ -189,6 +194,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
       return;
     }
 
+    setCurrentAudioBlob(file);
     setIsUploading(true);
     setUploadPercent(0);
     setErrorMessage(null);
@@ -257,8 +263,28 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
     try {
       const attendeeNames = meeting.attendees.map((a) => a.name);
 
+      // 직접 전송을 위한 audioBlob 취득: 메모리 state 확인 후 없으면 downloadUrl에서 fetch
+      let audioBlobToSend = currentAudioBlob;
+      if (!audioBlobToSend && meeting.recording.downloadUrl) {
+        try {
+          logger.info('Attempting to fetch audio blob from downloadUrl', { url: meeting.recording.downloadUrl });
+          const res = await fetch(meeting.recording.downloadUrl);
+          if (res.ok) {
+            audioBlobToSend = await res.blob();
+            setCurrentAudioBlob(audioBlobToSend);
+            logger.info('Audio blob obtained successfully from downloadUrl', {
+              size: audioBlobToSend.size,
+              type: audioBlobToSend.type,
+            });
+          }
+        } catch (blobFetchErr) {
+          logger.warn('Could not fetch audio blob from downloadUrl, proceeding with storage path fallback', blobFetchErr);
+        }
+      }
+
       const segments = await requestTranscription({
         meetingId: meeting.id,
+        audioBlob: audioBlobToSend || undefined,
         audioStoragePath: meeting.recording.storagePath,
         audioUrl: meeting.recording.downloadUrl,
         meetingTitle: meeting.title,
@@ -496,22 +522,42 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
               {!isReadOnly && (
                 <button
                   type="button"
+                  id="btn-ai-transcribe"
                   onClick={handleTriggerTranscription}
                   disabled={isTranscribing}
-                  className="flex items-center space-x-1.5 px-4 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-bold rounded-lg shadow-sm transition-all disabled:opacity-50"
+                  className="flex items-center space-x-2 px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-bold rounded-lg shadow-sm transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                 >
                   {isTranscribing ? (
                     <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                   ) : (
                     <Sparkles className="w-3.5 h-3.5 text-amber-300" />
                   )}
-                  <span>{isTranscribing ? 'AI 전사 분석 중...' : 'AI 화자 분리 전사'}</span>
+                  <span>
+                    {isTranscribing
+                      ? 'AI가 회의 음성을 분석하고 있습니다...'
+                      : transcribeError
+                      ? 'AI 화자 분리 전사 재시도'
+                      : 'AI 화자 분리 전사'}
+                  </span>
                 </button>
               )}
             </div>
           </div>
 
-          {/* 오디오 플레이어 */}
+          {/* AI 전사 분석 진행 중 로딩 배너 */}
+          {isTranscribing && (
+            <div className="p-4 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center space-x-3 text-indigo-900 text-xs animate-pulse">
+              <RefreshCw className="w-5 h-5 animate-spin text-indigo-600 shrink-0" />
+              <div>
+                <p className="font-bold text-sm">AI가 회의 음성을 분석하고 있습니다...</p>
+                <p className="text-indigo-600 text-xs mt-0.5">
+                  화자 분리(Diarization) 및 회의 대화록을 생성하고 있습니다. 오디오 길이에 따라 약 5~20초 소요됩니다.
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* 오디오 플레이어 (전사 실패 시에도 완벽 유지) */}
           {meeting.recording.downloadUrl && (
             <div className="pt-2">
               <audio
@@ -523,9 +569,24 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
             </div>
           )}
 
+          {/* AI 전사 에러 배너 (전사 실패 시 표시되며 재시도 가능) */}
           {transcribeError && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
-              {transcribeError}
+            <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex items-start space-x-3 text-xs text-red-800">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+              <div className="flex-1 space-y-1">
+                <p className="font-bold">AI 화자 분리 전사 실패</p>
+                <p className="text-red-700 leading-relaxed">{transcribeError}</p>
+                <p className="text-[11px] text-red-500 pt-1">
+                  기존 녹음 파일과 재생 기능은 안전하게 유지됩니다. 설정 또는 네트워크 상태를 확인한 후 상단의 [AI 화자 분리 전사 재시도] 버튼을 클릭해주세요.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTranscribeError(null)}
+                className="font-bold text-red-600 hover:text-red-800 px-2 py-1 text-xs"
+              >
+                닫기
+              </button>
             </div>
           )}
         </div>

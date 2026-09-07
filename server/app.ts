@@ -41,9 +41,25 @@ export function createApp(): express.Application {
   app.use('/api/*', (req: Request, res: Response) => {
     console.warn('[APP] 404 Not Found for API path', { path: req.originalUrl });
     res.status(404).json({
-      error: 'NOT_FOUND',
-      message: `요청하신 API 경로(${req.originalUrl})를 찾을 수 없습니다. 엔드포인트 철자 및 Vercel 라우팅 설정을 확인하세요.`,
-      statusCode: 404,
+      success: false,
+      error: `요청하신 API 경로(${req.originalUrl})를 찾을 수 없습니다.`,
+      detail: 'NOT_FOUND',
+    });
+  });
+
+  // Express 전역 에러 핸들러 (절대로 HTML을 반환하지 않고 반드시 JSON만 반환)
+  app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+    console.error('[APP] Global JSON error handler caught error:', err);
+    const statusCode = err.status || err.statusCode || (err.code === 'LIMIT_FILE_SIZE' ? 413 : 500);
+    const errorMessage =
+      err.code === 'LIMIT_FILE_SIZE'
+        ? '업로드 파일 크기가 서버 허용 한도(50MB)를 초과했습니다.'
+        : err.message || '서버 내부 오류가 발생했습니다.';
+
+    res.status(statusCode).json({
+      success: false,
+      error: errorMessage,
+      detail: err.detail || err.code || String(err),
     });
   });
 
