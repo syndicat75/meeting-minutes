@@ -196,16 +196,19 @@ export async function checkApiHealth(): Promise<ApiHealthResponse> {
 }
 
 /**
- * 음성 데이터를 서버로 전송하여 화자 분리 대화록 생성 요청
- * - 대용량 오디오의 경우 Vercel 요청 본문 한도(4.5MB) 초과를 방지하기 위해 audioStoragePath를 전달
- * - 사용자 Firebase ID 토큰을 Authorization 헤더에 안전하게 동봉
+ * 음성 데이터를 서버로 전송하여 화자 분리 대화록 및 사용 엔진 상세 정보 반환
  * @param {TranscribeRequestPayload} payload 전사 요청 데이터
- * @returns {Promise<TranscriptSegment[]>} 화자별 발언 단위 대화록 배열
+ * @returns {Promise<{ transcripts: TranscriptSegment[]; provider: 'openai' | 'gemini'; fallbackUsed: boolean; fullTranscript: string }>}
  */
-export async function requestTranscription(
+export async function requestTranscriptionDetails(
   payload: TranscribeRequestPayload
-): Promise<TranscriptSegment[]> {
-  logger.info('requestTranscription called', { meetingId: payload.meetingId });
+): Promise<{
+  transcripts: TranscriptSegment[];
+  provider: 'openai' | 'gemini';
+  fallbackUsed: boolean;
+  fullTranscript: string;
+}> {
+  logger.info('requestTranscriptionDetails called', { meetingId: payload.meetingId });
 
   // 1. Firebase ID 토큰 취득
   const idToken = await getCurrentUserIdToken();
@@ -227,7 +230,7 @@ export async function requestTranscription(
   if (payload.agenda) formData.append('agenda', payload.agenda);
   if (payload.attendeeNames) formData.append('attendeeNames', JSON.stringify(payload.attendeeNames));
 
-  // 오디오 Blob이 존재하는 경우 직접 업로드용 audioFile로 항상 첨부 (Vercel 및 로컬 서버에서 최우선으로 즉시 처리)
+  // 오디오 Blob이 존재하는 경우 직접 업로드용 audioFile로 항상 첨부
   if (payload.audioBlob && payload.audioBlob.size <= 45 * 1024 * 1024) {
     formData.append('audioFile', payload.audioBlob, 'recording.webm');
   } else if (!payload.audioStoragePath && payload.audioBlob && payload.audioBlob.size > 45 * 1024 * 1024) {
@@ -247,12 +250,35 @@ export async function requestTranscription(
     logger.info('Transcription response received', {
       segmentCount: data.transcripts?.length,
       speakerCount: data.speakers?.length,
+      provider: data.provider,
+      fallbackUsed: data.fallbackUsed,
     });
-    return (data.transcripts || []) as TranscriptSegment[];
+
+    return {
+      transcripts: (data.transcripts || []) as TranscriptSegment[],
+      provider: data.provider || 'openai',
+      fallbackUsed: Boolean(data.fallbackUsed),
+      fullTranscript: data.fullTranscript || '',
+    };
   } catch (err: any) {
-    logger.error('requestTranscription failed', { error: err?.message });
+    logger.error('requestTranscriptionDetails failed', { error: err?.message });
     throw err;
   }
+}
+
+/**
+ * 음성 데이터를 서버로 전송하여 화자 분리 대화록 생성 요청
+ * - 대용량 오디오의 경우 Vercel 요청 본문 한도(4.5MB) 초과를 방지하기 위해 audioStoragePath를 전달
+ * - 사용자 Firebase ID 토큰을 Authorization 헤더에 안전하게 동봉
+ * @param {TranscribeRequestPayload} payload 전사 요청 데이터
+ * @returns {Promise<TranscriptSegment[]>} 화자별 발언 단위 대화록 배열
+ */
+export async function requestTranscription(
+  payload: TranscribeRequestPayload
+): Promise<TranscriptSegment[]> {
+  logger.info('requestTranscription called', { meetingId: payload.meetingId });
+  const result = await requestTranscriptionDetails(payload);
+  return result.transcripts;
 }
 
 /**

@@ -30,14 +30,25 @@
 
 ```
 /
-├── server.ts                       # Express 백엔드 서버 (Gemini API 프록시 및 Vite 미들웨어)
+├── server.ts                       # Express 백엔드 서버 (Vite 미들웨어 및 프로덕션 진입점)
+├── server/
+│   ├── app.ts                      # Express 앱 초기화 및 라우트 마운트
+│   ├── config.ts                   # 모델명, API 키 환경변수, 제한치 중앙 설정
+│   ├── routes.ts                   # /api/health, /api/ai/transcribe, /api/ai/summarize
+│   ├── auth.ts                     # Firebase ID 토큰 및 회의 권한 검증
+│   ├── storage.ts                  # Firebase Cloud Storage 오디오 다운로드
+│   ├── gemini.ts                   # Gemini 3.6 Flash 요약 및 레거시 전사
+│   └── ai/
+│       ├── openaiTranscription.ts  # OpenAI gpt-4o-transcribe-diarize 공식 전사 엔진
+│       ├── geminiTranscription.ts  # Gemini 3.6 Flash Fallback 전사 모듈
+│       └── transcriptionService.ts # Provider 추상화, 자동 Fallback, 긴 회의 청크 병합
 ├── firestore.rules                 # Firestore 보안 규칙 (소유자/참석자 인가 및 확정본 위변조 방지)
 ├── storage.rules                   # Storage 보안 규칙 (오디오, 사진, 서명 경로 및 용량 검증)
 ├── firebase.json                   # Firebase 호스팅 및 에뮬레이터 설정
 ├── Design.md                       # 본 앱 구조 및 아키텍처 설계 문서
 ├── src/
 │   ├── config/
-│   │   └── appConfig.ts            # 모델명(gemini-3.6-flash), API 키, 스토리지 키 중앙 집중 설정
+│   │   └── appConfig.ts            # 모델명, API 키, 스토리지 키 중앙 집중 설정
 │   ├── types/
 │   │   ├── meeting.ts              # 회의, 참석자, 대화록, 요약, 서명, 사진 TypeScript 인터페이스
 │   │   └── auth.ts                 # 사용자 인증 및 Firebase 연결 상태 인터페이스
@@ -50,7 +61,7 @@
 │   │   ├── audioRecorder.ts        # 브라우저 Web Audio API 및 MediaRecorder 녹음 엔진
 │   │   ├── indexedDbAudio.ts       # 녹음 중 새로고침/이탈 대비 IndexedDB 청크 임시 보존
 │   │   ├── storageService.ts       # 오디오/사진(Canvas EXIF 제거)/서명 PNG 업로드
-│   │   └── aiService.ts            # 백엔드 Gemini 전사 및 요약 REST API 클라이언트
+│   │   └── aiService.ts            # 백엔드 AI 전사(OpenAI+Gemini Fallback) 및 요약 REST 클라이언트
 │   ├── components/
 │   │   ├── common/
 │   │   │   ├── Header.tsx          # 상단 헤더, 로고, Firebase 상태 배지, Google 로그인
@@ -64,7 +75,7 @@
 │   │       ├── SignatureModal.tsx  # 전자서명 모달 (터치/마우스/펜, 공용 태블릿 연속 서명 지원)
 │   │       └── tabs/
 │   │           ├── BasicInfoTab.tsx    # 1. 기본 정보 탭 (일자, 장소, 안건, 권한 공유)
-│   │           ├── RecordingTab.tsx    # 2. 녹음 및 오디오 탭 (볼륨 미터, 동의 확인, 파일 업로드)
+│   │           ├── RecordingTab.tsx    # 2. 녹음 및 오디오 탭 (볼륨 미터, 동의 확인, 파일 업로드, AI 엔진 표시)
 │   │           ├── TranscriptTab.tsx   # 3. 화자별 대화록 탭 (화자 매핑, 타임스탬프 재생, TXT 다운)
 │   │           ├── SummaryTab.tsx      # 4. 요약 및 회의내용 탭 (구분/내용 표, 후속조치, 재생성 비교)
 │   │           ├── PhotosTab.tsx       # 5. 회의 사진 탭 (현장 촬영, 회전, 순서 변경, 캡션)
@@ -259,6 +270,53 @@ Vercel에서 Vite SPA 화면과 Express 백엔드 API를 동시에 배포할 때
 4. **Gemini 404 모델 에러 사용자 친화적 메시지 처리**:
    - Gemini API에서 404/NOT_FOUND 또는 'no longer available' 발생 시 단순 "서버 내부 오류"가 아닌 "현재 설정된 AI 모델을 사용할 수 없습니다. 관리자에게 Gemini 모델 설정 확인을 요청해주세요." 안내 표출.
    - 개발자 로그에는 실제 오류 전체를 상세 기록하여 즉각적인 원인 파악 지원.
+
+### 8.10. OpenAI 우선 + Gemini Fallback 전사 파이프라인 및 긴 회의 대응 설계
+1. **듀얼 AI Provider 추상화 아키텍처**:
+   - Primary: OpenAI 공식 Transcription API (`gpt-4o-transcribe-diarize`)
+   - Fallback: Google Gemini API (`gemini-3.6-flash`)
+   - 분리된 모듈 구조:
+     - `server/ai/openaiTranscription.ts`: OpenAI toFile 스트림 생성 및 화자 분리(Diarization) 전사
+     - `server/ai/geminiTranscription.ts`: Gemini 화자 분리 구조화 전사 모듈
+     - `server/ai/transcriptionService.ts`: 공급자 오케스트레이션, 에러 분류 및 자동 전환
+2. **정밀 에러 분류 및 Fallback 조건**:
+   - **자동 Fallback 대상**: 429(Rate Limit), 500/502/503/504(Server Error), 요청 타임아웃, 네트워크 오류, 임시 모델 사용 불가.
+   - **Fallback 차단 대상**:
+     - 401(Invalid API Key), 403(Permission Denied): "OpenAI API 설정을 확인해주세요." 관리자 안내 메시지 즉시 반환.
+     - 400(Invalid Request): 잘못된 요청에 대해 불필요한 Gemini 요청을 차단하고 상세 사유 반환.
+   - 두 엔진 모두 실패 시 서버 로그에 두 오류를 모두 기록(`[transcription] Both OpenAI and Gemini fallback failed!`)하고 502 에러 반환.
+3. **통일된 응답 데이터 규격**:
+   ```json
+   {
+     "success": true,
+     "provider": "openai",
+     "fallbackUsed": false,
+     "speakers": [
+       { "speaker": "화자 1", "startTime": 0, "endTime": 5.3, "text": "회의를 시작하겠습니다." }
+     ],
+     "fullTranscript": "...",
+     "summary": null,
+     "transcripts": [ ... ]
+   }
+   ```
+4. **UI 표시 정책**:
+   - 일반 사용자의 시각적 복잡도를 낮추기 위해 메인 뷰에서는 provider를 강조하지 않음.
+   - 녹음 상세 메타데이터 영역에 `AI 전사 엔진: OpenAI` 또는 `AI 전사 엔진: Gemini (Fallback)` 상태 뱃지 제공.
+5. **긴 회의(30분~3시간) 청크 분할 및 화자 병합 정책**:
+   - 브라우저 녹음 파일은 IndexedDB 및 Firebase Cloud Storage에 분할/스트리밍 업로드하여 메모리 초과를 원천 차단.
+   - 청크별 순차 전사(`transcribeAudioChunksSequentially`) 지원: 각 구간별 타임스탬프를 보정(Time Offset 가산).
+   - 화자 식별자 충돌 방지: 서로 다른 청크의 '화자 1'을 무조건 동일인으로 합치지 않고, 청크 식별자(`[1구간] 화자 1`, `[2구간] 화자 1`)를 보존하며 참석자가 1명으로 확정된 경우에만 정규화 매핑 수행.
+6. **보안 및 규격 준수 로깅**:
+   - 표준 로그 출력:
+     - `[transcription] primary provider: openai`
+     - `[transcription] model: gpt-4o-transcribe-diarize`
+     - `[transcription] file type: audio/webm`
+     - `[transcription] file size: 123456`
+     - `[transcription] OpenAI success` (또는 `OpenAI failure`)
+     - `[transcription] Gemini fallback started`
+     - `[transcription] Gemini fallback success` (또는 `failure`)
+   - API Key는 어떠한 로그에도 절대 출력하지 않음.
+
 
 
 

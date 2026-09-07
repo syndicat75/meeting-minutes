@@ -155,6 +155,26 @@ export interface RecordingMetadata {
   uploadedAt: string;
   isConsentGiven: boolean; // 참석자 녹음 및 AI 처리 사전 안내 확인 여부
   tempIndexedDbKey?: string; // 오프라인/임시 복구 키
+  transcriptionProvider?: 'openai' | 'gemini'; // 사용된 전사 엔진
+  fallbackUsed?: boolean; // Gemini fallback 전환 여부
+}
+
+/**
+ * AI 전사 응답 전체 데이터
+ */
+export interface TranscribeResponseData {
+  success: boolean;
+  provider: 'openai' | 'gemini';
+  fallbackUsed: boolean;
+  speakers: Array<{
+    speaker: string;
+    startTime: number;
+    endTime: number;
+    text: string;
+  }>;
+  fullTranscript: string;
+  summary: string | null;
+  transcripts: TranscriptSegment[];
 }
 
 /**

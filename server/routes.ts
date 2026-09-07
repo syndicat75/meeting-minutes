@@ -15,10 +15,8 @@ import {
   AuthenticatedRequest,
 } from './auth.js';
 import { downloadMeetingAudioFromStorage } from './storage.js';
-import {
-  transcribeAudioWithGemini,
-  summarizeMeetingWithGemini,
-} from './gemini.js';
+import { summarizeMeetingWithGemini } from './gemini.js';
+import { executeTranscription } from './ai/transcriptionService.js';
 
 export const apiRouter = express.Router();
 
@@ -55,10 +53,14 @@ apiRouter.get('/health', (req: Request, res: Response) => {
     service: 'ai-meeting-notes-api',
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'development',
+    primaryProvider: env.primaryProvider,
+    fallbackProvider: env.fallbackProvider,
+    openaiConfigured: Boolean(env.openaiApiKey && env.openaiApiKey !== 'MY_OPENAI_API_KEY'),
     geminiConfigured: Boolean(env.geminiApiKey && env.geminiApiKey !== 'MY_GEMINI_API_KEY'),
     firebaseConfigured: Boolean(env.firebaseProjectId),
     storageBucketConfigured: Boolean(env.firebaseStorageBucket),
-    model: SERVER_CONFIG.geminiModel,
+    openaiModel: env.openaiTranscribeModel,
+    geminiModel: env.geminiModel,
     limits: {
       directUploadLimitMb: Math.round(SERVER_CONFIG.directUploadLimitBytes / 1024 / 1024),
       storageMaxLimitMb: Math.round(SERVER_CONFIG.storageMaxAudioSizeBytes / 1024 / 1024),
@@ -81,14 +83,17 @@ apiRouter.post(
     console.log('[ROUTES] POST /api/ai/transcribe called');
 
     try {
-      // 1. 환경변수 GEMINI_API_KEY 확인
-      const { geminiApiKey } = getServerEnv();
-      if (!geminiApiKey || geminiApiKey.trim() === '' || geminiApiKey === 'MY_GEMINI_API_KEY') {
-        console.error('[transcription] GEMINI_API_KEY is not configured on server');
+      // 1. 환경변수 API 키 확인 (OpenAI 우선, Gemini Fallback)
+      const env = getServerEnv();
+      const hasOpenAiKey = Boolean(env.openaiApiKey && env.openaiApiKey.trim() !== '' && env.openaiApiKey !== 'MY_OPENAI_API_KEY');
+      const hasGeminiKey = Boolean(env.geminiApiKey && env.geminiApiKey.trim() !== '' && env.geminiApiKey !== 'MY_GEMINI_API_KEY');
+
+      if (!hasOpenAiKey && !hasGeminiKey) {
+        console.error('[transcription] Neither OPENAI_API_KEY nor GEMINI_API_KEY is configured on server');
         return res.status(503).json({
           success: false,
-          error: 'GEMINI_API_KEY가 서버에 설정되어 있지 않습니다.',
-          detail: 'Vercel 프로젝트 Settings > Environment Variables 또는 .env에 GEMINI_API_KEY를 등록해주세요.',
+          error: 'AI 음성 전사 API Key가 서버에 설정되어 있지 않습니다.',
+          detail: 'Vercel 프로젝트 Settings > Environment Variables 또는 .env에 OPENAI_API_KEY 또는 GEMINI_API_KEY를 등록해주세요.',
         });
       }
 
@@ -218,21 +223,26 @@ apiRouter.post(
         });
       }
 
-      // 6. Gemini 3.6 Flash 모델 전사 실행
-      const result = await transcribeAudioWithGemini(audioBuffer, mimeType, {
+      // 6. OpenAI 우선 + Gemini Fallback 전사 파이프라인 실행
+      const result = await executeTranscription(audioBuffer, mimeType, {
+        meetingId,
         meetingTitle,
         agenda,
         attendeeNames,
       });
 
       console.log('[ROUTES] Transcription response ready with speakers and segments', {
+        provider: result.provider,
+        fallbackUsed: result.fallbackUsed,
         speakerCount: result.speakers.length,
         segmentCount: result.transcripts.length,
       });
 
-      // 7. 성공 응답: 요구된 speakers, transcript, fullTranscript, summary와 기존 transcripts 모두 포함
+      // 7. 성공 응답: provider, fallbackUsed, speakers, transcript, fullTranscript, summary, transcripts 모두 반환
       return res.json({
         success: true,
+        provider: result.provider,
+        fallbackUsed: result.fallbackUsed,
         transcript: result.fullTranscript,
         speakers: result.speakers,
         fullTranscript: result.fullTranscript,

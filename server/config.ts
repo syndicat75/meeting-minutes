@@ -11,7 +11,14 @@ dotenv.config();
  * 서버 전역 설정 상수 객체
  */
 export const SERVER_CONFIG = {
-  // 사용 AI 모델 (Gemini 3.6 Flash: 최신 안정 모델, GEMINI_MODEL 환경변수로 재지정 가능)
+  // AI 우선 및 Fallback 공급자 설정 ('openai' | 'gemini')
+  primaryProvider: process.env.AI_PRIMARY_PROVIDER || 'openai',
+  fallbackProvider: process.env.AI_FALLBACK_PROVIDER || 'gemini',
+
+  // OpenAI 전사 모델 (공식 화자 분리 Diarization 지원 모델)
+  openaiTranscribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe-diarize',
+
+  // Gemini AI 모델 (Gemini 3.6 Flash: 최신 안정 모델, GEMINI_MODEL 환경변수로 재지정 가능)
   geminiModel: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
 
   // 지원 및 허용되는 최신 fallback 모델 목록 (구형 gemini-2.5-flash 배제)
@@ -57,6 +64,10 @@ export const SERVER_CONFIG = {
  * @returns {Record<string, string | undefined>}
  */
 export function getServerEnv(): {
+  openaiApiKey: string | undefined;
+  openaiTranscribeModel: string;
+  primaryProvider: string;
+  fallbackProvider: string;
   geminiApiKey: string | undefined;
   geminiModel: string;
   firebaseProjectId: string | undefined;
@@ -65,6 +76,10 @@ export function getServerEnv(): {
 } {
   console.log('[CONFIG] getServerEnv called');
   return {
+    openaiApiKey: process.env.OPENAI_API_KEY,
+    openaiTranscribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || SERVER_CONFIG.openaiTranscribeModel,
+    primaryProvider: process.env.AI_PRIMARY_PROVIDER || SERVER_CONFIG.primaryProvider,
+    fallbackProvider: process.env.AI_FALLBACK_PROVIDER || SERVER_CONFIG.fallbackProvider,
     geminiApiKey: process.env.GEMINI_API_KEY,
     geminiModel: process.env.GEMINI_MODEL || SERVER_CONFIG.geminiModel,
     firebaseProjectId: process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID,

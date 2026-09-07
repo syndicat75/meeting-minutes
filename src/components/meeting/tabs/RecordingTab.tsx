@@ -24,7 +24,7 @@ import { Meeting, RecordingMetadata } from '../../../types/meeting';
 import { BrowserAudioRecorder, RecorderState } from '../../../services/audioRecorder';
 import { uploadRecordingAudio } from '../../../services/storageService';
 import { removeAudioSession } from '../../../services/indexedDbAudio';
-import { requestTranscription } from '../../../services/aiService';
+import { requestTranscriptionDetails } from '../../../services/aiService';
 import { formatDuration, formatFileSize } from '../../../utils/formatters';
 import { APP_CONFIG } from '../../../config/appConfig';
 import { logger } from '../../../utils/logger';
@@ -282,7 +282,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         }
       }
 
-      const segments = await requestTranscription({
+      const result = await requestTranscriptionDetails({
         meetingId: meeting.id,
         audioBlob: audioBlobToSend || undefined,
         audioStoragePath: meeting.recording.storagePath,
@@ -292,10 +292,20 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         attendeeNames,
       });
 
-      logger.info('Transcription completed, updating meeting', { count: segments.length });
+      logger.info('Transcription completed, updating meeting', {
+        count: result.transcripts.length,
+        provider: result.provider,
+        fallbackUsed: result.fallbackUsed,
+      });
+
       onUpdateMeeting({
-        transcripts: segments,
+        transcripts: result.transcripts,
         status: meeting.status === 'draft' ? 'review' : meeting.status,
+        recording: {
+          ...meeting.recording,
+          transcriptionProvider: result.provider,
+          fallbackUsed: result.fallbackUsed,
+        },
       });
 
       // 대화록 탭으로 자동 전환 안내
@@ -498,9 +508,20 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
               </div>
               <div>
                 <h4 className="text-sm font-bold text-slate-900">{meeting.recording.fileName}</h4>
-                <p className="text-xs text-slate-500">
-                  길이: {formatDuration(meeting.recording.durationSeconds)} | 크기:{' '}
-                  {formatFileSize(meeting.recording.fileSizeBytes)} | 형식: {meeting.recording.mimeType}
+                <p className="text-xs text-slate-500 flex items-center gap-1.5 flex-wrap">
+                  <span>길이: {formatDuration(meeting.recording.durationSeconds)}</span>
+                  <span>|</span>
+                  <span>크기: {formatFileSize(meeting.recording.fileSizeBytes)}</span>
+                  <span>|</span>
+                  <span>형식: {meeting.recording.mimeType}</span>
+                  {meeting.recording.transcriptionProvider && (
+                    <>
+                      <span>|</span>
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 text-slate-600 border border-slate-200/80">
+                        AI 전사 엔진: {meeting.recording.transcriptionProvider === 'openai' ? 'OpenAI' : 'Gemini (Fallback)'}
+                      </span>
+                    </>
+                  )}
                 </p>
               </div>
             </div>
