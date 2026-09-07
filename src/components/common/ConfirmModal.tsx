@@ -4,7 +4,7 @@
  */
 
 import React from 'react';
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, Loader2 } from 'lucide-react';
 import { logger } from '../../utils/logger';
 
 interface ConfirmModalProps {
@@ -14,6 +14,7 @@ interface ConfirmModalProps {
   confirmText?: string;
   cancelText?: string;
   isDestructive?: boolean;
+  isLoading?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -28,10 +29,11 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
   confirmText = '확인',
   cancelText = '취소',
   isDestructive = false,
+  isLoading = false,
   onConfirm,
   onCancel,
 }) => {
-  logger.debug('ConfirmModal rendered', { isOpen, title, isDestructive });
+  logger.debug('ConfirmModal rendered', { isOpen, title, isDestructive, isLoading });
   if (!isOpen) return null;
 
   return (
@@ -55,20 +57,23 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
           <button
             type="button"
             onClick={onCancel}
-            className="px-3.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200 rounded transition-colors"
+            disabled={isLoading}
+            className="px-3.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200 disabled:opacity-50 rounded transition-colors"
           >
             {cancelText}
           </button>
           <button
             type="button"
             onClick={onConfirm}
-            className={`px-4 py-1.5 text-xs font-semibold text-white rounded shadow-sm transition-colors ${
+            disabled={isLoading}
+            className={`inline-flex items-center space-x-1.5 px-4 py-1.5 text-xs font-semibold text-white rounded shadow-sm transition-colors disabled:opacity-50 ${
               isDestructive
                 ? 'bg-red-600 hover:bg-red-500 active:bg-red-700'
                 : 'bg-blue-600 hover:bg-blue-500 active:bg-blue-700'
             }`}
           >
-            {confirmText}
+            {isLoading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+            <span>{isLoading ? '처리 중...' : confirmText}</span>
           </button>
         </div>
       </div>

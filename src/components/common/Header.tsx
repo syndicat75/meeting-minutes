@@ -4,13 +4,14 @@
  */
 
 import React from 'react';
-import { FileText, Plus, Database, LogIn, LogOut, CheckCircle, AlertTriangle } from 'lucide-react';
+import { FileText, Plus, Database, LogIn, LogOut, CheckCircle, AlertTriangle, Loader2 } from 'lucide-react';
 import { AppUser, FirebaseConnectionStatus } from '../../types/auth';
 import { logger } from '../../utils/logger';
 
 interface HeaderProps {
   currentUser: AppUser | null;
   firebaseStatus: FirebaseConnectionStatus;
+  isLoggingIn?: boolean;
   onOpenFirebaseModal: () => void;
   onLogin: () => void;
   onLogout: () => void;
@@ -24,13 +25,39 @@ interface HeaderProps {
 export const Header: React.FC<HeaderProps> = ({
   currentUser,
   firebaseStatus,
+  isLoggingIn = false,
   onOpenFirebaseModal,
   onLogin,
   onLogout,
   onNewMeeting,
   onGoHome,
 }) => {
-  logger.debug('Header rendered', { hasUser: Boolean(currentUser), isConfigured: firebaseStatus.isConfigured });
+  logger.debug('Header rendered', { hasUser: Boolean(currentUser), isConfigured: firebaseStatus.isConfigured, isLoggingIn });
+
+  // 연결 상태별 텍스트 및 스타일 계산
+  const getStatusDisplay = () => {
+    if (!firebaseStatus.isConfigured) {
+      return {
+        label: 'Firebase 미설정 (로컬)',
+        bg: 'bg-amber-950/60 text-amber-300 border-amber-700/60 hover:bg-amber-900/60',
+        icon: <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />,
+      };
+    }
+    if (firebaseStatus.firestoreVerified) {
+      return {
+        label: 'Firebase 클라우드 연동됨',
+        bg: 'bg-emerald-950/60 text-emerald-300 border-emerald-700/60 hover:bg-emerald-900/60',
+        icon: <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />,
+      };
+    }
+    return {
+      label: 'Firebase 설정됨 (미검증)',
+      bg: 'bg-blue-950/60 text-blue-300 border-blue-700/60 hover:bg-blue-900/60',
+      icon: <Database className="w-3.5 h-3.5 text-blue-400" />,
+    };
+  };
+
+  const statusDisplay = getStatusDisplay();
 
   return (
     <header className="sticky top-0 z-40 bg-slate-900 border-b border-slate-800 text-white shadow-md">
@@ -64,22 +91,12 @@ export const Header: React.FC<HeaderProps> = ({
             id="btn-firebase-status"
             type="button"
             onClick={onOpenFirebaseModal}
-            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
-              firebaseStatus.isConfigured
-                ? 'bg-emerald-950/60 text-emerald-300 border-emerald-700/60 hover:bg-emerald-900/60'
-                : 'bg-amber-950/60 text-amber-300 border-amber-700/60 hover:bg-amber-900/60'
-            }`}
-            title="Firebase 연결 설정 및 상태 확인"
+            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${statusDisplay.bg}`}
+            title="Firebase 연결 설정 및 상태 진단"
           >
             <Database className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">
-              {firebaseStatus.isConfigured ? 'Firebase 연결됨' : 'Firebase 설정 필요'}
-            </span>
-            {firebaseStatus.isConfigured ? (
-              <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
-            ) : (
-              <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
-            )}
+            <span className="hidden md:inline">{statusDisplay.label}</span>
+            {statusDisplay.icon}
           </button>
 
           {/* 신규 회의 작성 버튼 */}
@@ -130,11 +147,16 @@ export const Header: React.FC<HeaderProps> = ({
             <button
               id="btn-header-login"
               type="button"
+              disabled={isLoggingIn}
               onClick={onLogin}
-              className="flex items-center space-x-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs sm:text-sm font-medium px-2.5 py-1.5 rounded-lg transition-colors"
+              className="flex items-center space-x-1.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 disabled:opacity-60 text-slate-200 border border-slate-700 text-xs sm:text-sm font-medium px-2.5 py-1.5 rounded-lg transition-colors"
             >
-              <LogIn className="w-4 h-4" />
-              <span className="hidden sm:inline">Google 로그인</span>
+              {isLoggingIn ? (
+                <Loader2 className="w-4 h-4 animate-spin text-blue-400" />
+              ) : (
+                <LogIn className="w-4 h-4" />
+              )}
+              <span>{isLoggingIn ? '로그인 중...' : 'Google 로그인'}</span>
             </button>
           )}
         </div>

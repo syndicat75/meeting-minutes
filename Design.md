@@ -127,3 +127,22 @@
 4. **Firebase Storage 활성화**: 기본 버킷 생성 후 제공된 `storage.rules` 배포.
 5. **웹 앱 등록 및 구성값 적용**:
    - Firebase 콘솔의 웹 앱 설정에서 발급받은 구성값(`apiKey`, `projectId`, `storageBucket` 등)을 앱 우측 상단의 [Firebase 설정] 모달의 '직접 설정 입력' 탭에 저장하거나 환경 변수에 등록합니다.
+
+---
+
+## 7. 회의 데이터 무결성 및 로컬/클라우드 안전 정책 (Data Integrity & Safety Policy)
+
+1. **로컬 초안(Draft)과 클라우드 문서의 명확한 분리**:
+   - `isLocalDraftMeeting(meeting)`을 통해 Firebase 미설정 상태에서 작성된 로컬 초안과 Firestore에 동기화된 클라우드 문서를 명확히 구별합니다.
+   - UI 카드에 **[로컬 초안]** (호박색) 및 **[클라우드]** (에메랄드색) 배지를 명시하여 사용자가 데이터 저장 위치를 직관적으로 파악할 수 있습니다.
+2. **안전한 회의록 삭제(Delete) 정책**:
+   - **로컬 초안**: 소유자 로그인 여부와 무관하게 사용자가 확인 후 로컬 기기 저장소에서 즉각 삭제합니다.
+   - **클라우드 문서**: 소유자(`ownerId`)의 계정 일치 여부를 검증한 후 Firestore `deleteDoc`을 먼저 실행하며, 서버 삭제 성공 시에만 로컬 상태를 갱신합니다.
+   - **감사 기록 보존**: 회의록 본문 삭제 시에도 첨부된 녹음 및 전자서명 파일은 규정 및 백업 요구사항에 따라 영구 삭제되지 않고 별도 보존될 수 있음을 사용자에게 사전 고지합니다.
+3. **Firestore 직렬화 무결성 보장**:
+   - Firestore는 `undefined` 필드 저장을 거부하므로, 모든 저장/업데이트 요청 전 `sanitizeForFirestore`를 통해 중첩 객체 및 배열 내 `undefined` 값을 안전하게 정리합니다.
+4. **복합 인덱스 오류 방지**:
+   - Firestore 다중 필드 쿼리(`where` + `orderBy`) 시 발생할 수 있는 인덱스 미생성 오류를 원천 차단하기 위해, 조건 조회 후 메모리 내에서 최신순 정렬을 수행합니다.
+5. **Google 인증 오류 상세 진단**:
+   - `parseFirebaseAuthError`를 통해 `auth/popup-blocked`, `auth/unauthorized-domain`, `auth/network-request-failed` 등의 에러 코드를 한국어 상세 안내 및 해결 방법(팝업 차단 해제, 승인된 도메인 등록 등)으로 즉각 변환하여 사용자에게 제공합니다.
+

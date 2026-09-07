@@ -14,16 +14,119 @@ import {
   User as FbUser,
   Auth,
 } from 'firebase/auth';
-import { getFirestore, Firestore } from 'firebase/firestore';
+import { getFirestore, Firestore, doc, getDoc } from 'firebase/firestore';
 import { getStorage, FirebaseStorage } from 'firebase/storage';
 import { getFirebaseConfig } from '../config/appConfig';
-import { AppUser, FirebaseConnectionStatus } from '../types/auth';
+import { AppUser, FirebaseConnectionStatus, AuthErrorInfo } from '../types/auth';
 import { logger } from '../utils/logger';
 
 let appInstance: FirebaseApp | null = null;
 let authInstance: Auth | null = null;
 let firestoreInstance: Firestore | null = null;
 let storageInstance: FirebaseStorage | null = null;
+
+let isFirestoreVerified = false;
+let verifiedTimestamp: string | undefined = undefined;
+
+/**
+ * Firebase 인증 오류를 사용자가 이해하기 쉬운 한국어 진단 정보로 변환
+ * @param error 발생한 에러 객체
+ * @returns {AuthErrorInfo} 구조화된 오류 안내 객체
+ */
+export function parseFirebaseAuthError(error: any): AuthErrorInfo {
+  logger.info('parseFirebaseAuthError called', { code: error?.code, message: error?.message });
+
+  const code = error?.code || 'unknown';
+  const rawMessage = error?.message || '로그인 중 오류가 발생했습니다.';
+  const hostname = typeof window !== 'undefined' ? window.location.hostname : '알 수 없음';
+  const isIframe = typeof window !== 'undefined' && window.self !== window.top;
+
+  switch (code) {
+    case 'auth/unauthorized-domain':
+      return {
+        code,
+        title: '승인되지 않은 도메인 (Unauthorized Domain)',
+        message: `현재 접속 도메인('${hostname}')이 Firebase 인증 승인 목록에 등록되지 않았습니다.`,
+        solution: `Firebase 콘솔 > [Authentication] > [설정(Settings)] > [승인된 도메인(Authorized domains)]으로 이동하여 '${hostname}'을 추가해주세요.`,
+        hostname,
+        isIframe,
+      };
+
+    case 'auth/operation-not-allowed':
+      return {
+        code,
+        title: 'Google 로그인 제공업체 비활성화',
+        message: 'Firebase 프로젝트에서 Google 로그인 기능이 활성화되어 있지 않습니다.',
+        solution: 'Firebase 콘솔 > [Authentication] > [Sign-in method] 탭에서 "Google"을 선택하고 [사용 설정]을 저장해주세요.',
+        hostname,
+        isIframe,
+      };
+
+    case 'auth/configuration-not-found':
+      return {
+        code,
+        title: 'Authentication 초기 설정 필요',
+        message: 'Firebase 프로젝트에 Authentication 서비스가 아직 초기화되지 않았습니다.',
+        solution: 'Firebase 콘솔에서 [Authentication] 메뉴로 이동하여 [시작하기] 버튼을 누른 후 Google 공급업체를 설정해주세요.',
+        hostname,
+        isIframe,
+      };
+
+    case 'auth/invalid-api-key':
+      return {
+        code,
+        title: '잘못된 Firebase API 키',
+        message: '등록된 Firebase apiKey가 유효하지 않습니다.',
+        solution: 'Firebase 콘솔 [프로젝트 설정]의 웹 앱 구성에서 올바른 apiKey를 확인해 등록해주세요. (주의: Gemini API 키와 혼동하지 마세요)',
+        hostname,
+        isIframe,
+      };
+
+    case 'auth/popup-blocked':
+      return {
+        code,
+        title: '로그인 팝업 창 차단됨',
+        message: isIframe
+          ? 'AI Studio 미리보기(iframe) 환경에서는 브라우저 보안 정책에 의해 Google 로그인 팝업이 차단될 수 있습니다.'
+          : '브라우저 설정에 의해 로그인 팝업 창이 차단되었습니다.',
+        solution: isIframe
+          ? '상단 브라우저 주소창에서 팝업을 허용하거나, 상단의 [새 탭에서 열기] 아이콘을 눌러 새 창에서 실행해주세요.'
+          : '주소창 우측의 팝업 차단 해제 아이콘을 눌러 팝업을 허용해주세요.',
+        hostname,
+        isIframe,
+      };
+
+    case 'auth/popup-closed-by-user':
+      return {
+        code,
+        title: '로그인 창이 닫힘',
+        message: '사용자가 로그인 팝업 창을 완료 전에 닫았습니다.',
+        solution: '로그인을 계속하시려면 다시 [Google 로그인] 버튼을 눌러주세요.',
+        hostname,
+        isIframe,
+      };
+
+    case 'auth/network-request-failed':
+      return {
+        code,
+        title: '네트워크 연결 실패',
+        message: 'Firebase 서버와 통신할 수 없습니다.',
+        solution: '인터넷 연결 상태, 사내 방화벽 또는 광고/트래커 차단 프로그램(AdBlock 등) 설정을 확인해주세요.',
+        hostname,
+        isIframe,
+      };
+
+    default:
+      return {
+        code,
+        title: 'Google 로그인 오류',
+        message: rawMessage,
+        solution: 'Firebase 프로젝트 설정과 브라우저 콘솔 오류 로그를 확인해주세요.',
+        hostname,
+        isIframe,
+      };
+  }
+}
 
 /**
  * Firebase 클라이언트 인스턴스 초기화
@@ -38,8 +141,13 @@ export function initFirebase(): FirebaseConnectionStatus {
     return {
       isConfigured: false,
       authConnected: false,
+      authReady: false,
+      isAuthenticated: false,
       firestoreConnected: false,
+      firestoreVerified: false,
       storageConnected: false,
+      storageConfigured: false,
+      verificationState: 'unconfigured',
       errorMessage: 'Firebase 환경변수 또는 설정이 등록되지 않았습니다.',
     };
   }
@@ -56,21 +164,72 @@ export function initFirebase(): FirebaseConnectionStatus {
     firestoreInstance = getFirestore(appInstance);
     storageInstance = getStorage(appInstance);
 
+    const isAuthed = Boolean(authInstance?.currentUser);
+
     return {
       isConfigured: true,
       projectId: config.projectId,
-      authConnected: true,
-      firestoreConnected: true,
-      storageConnected: true,
+      authConnected: Boolean(authInstance),
+      authReady: Boolean(authInstance),
+      isAuthenticated: isAuthed,
+      firestoreConnected: isFirestoreVerified,
+      firestoreVerified: isFirestoreVerified,
+      storageConnected: Boolean(config.storageBucket),
+      storageConfigured: Boolean(config.storageBucket),
+      verificationState: isFirestoreVerified ? 'verified' : 'configured_unverified',
+      verifiedAt: verifiedTimestamp,
     };
   } catch (error: any) {
     logger.error('Firebase initialization error', { message: error?.message });
     return {
       isConfigured: false,
       authConnected: false,
+      authReady: false,
+      isAuthenticated: false,
       firestoreConnected: false,
+      firestoreVerified: false,
       storageConnected: false,
+      storageConfigured: false,
+      verificationState: 'error',
       errorMessage: error?.message || 'Firebase 초기화 실패',
+    };
+  }
+}
+
+/**
+ * 실제 Cloud Firestore 서버 접근성 검증 (Health Check)
+ * SDK 객체 생성만으로 '연결됨'으로 오판하지 않도록 실제 테스트 조회를 수행합니다.
+ */
+export async function testFirestoreConnection(): Promise<{ success: boolean; message: string }> {
+  logger.info('testFirestoreConnection called');
+  const db = getFirebaseDb();
+  if (!db) {
+    return { success: false, message: 'Firebase 설정이 등록되지 않았습니다.' };
+  }
+
+  try {
+    // 실제 서버 통신 테스트: 시스템 핑 문서 조회
+    const pingDoc = doc(db, '_connection_test', 'ping');
+    await getDoc(pingDoc);
+    isFirestoreVerified = true;
+    verifiedTimestamp = new Date().toISOString();
+    logger.info('Firestore server access verified successfully');
+    return { success: true, message: 'Cloud Firestore 서버 접근이 성공적으로 검증되었습니다.' };
+  } catch (err: any) {
+    logger.warn('Firestore test connection failed', { error: err?.message, code: err?.code });
+    if (err?.code === 'permission-denied') {
+      // 보안 규칙으로 거부된 것은 서버 자체에는 도달했음을 의미하므로 규칙 안내
+      isFirestoreVerified = true;
+      verifiedTimestamp = new Date().toISOString();
+      return {
+        success: true,
+        message: 'Firestore 서버에 연결되었으나 현재 보안 규칙상 로그인이 필요합니다.',
+      };
+    }
+    isFirestoreVerified = false;
+    return {
+      success: false,
+      message: `서버 통신 실패 (${err?.code || '오류'}): ${err?.message || '네트워크 확인 필요'}`,
     };
   }
 }
@@ -128,14 +287,7 @@ export async function signInWithGoogle(): Promise<AppUser> {
     };
   } catch (error: any) {
     logger.error('signInWithGoogle failed', { errorCode: error.code, errorMessage: error.message });
-    if (error.code === 'auth/popup-blocked') {
-      throw new Error('팝업 창이 브라우저에 의해 차단되었습니다. 팝업 허용 후 다시 시도해주세요.');
-    } else if (error.code === 'auth/popup-closed-by-user') {
-      throw new Error('사용자가 로그인 창을 닫았습니다.');
-    } else if (error.code === 'auth/unauthorized-domain') {
-      throw new Error('Firebase 콘솔의 Authentication > Settings > 승인된 도메인에 현재 호스트 도메인을 등록해야 합니다.');
-    }
-    throw new Error(error.message || 'Google 로그인 중 오류가 발생했습니다.');
+    throw error;
   }
 }
 
@@ -191,4 +343,5 @@ export const loginWithGoogle = signInWithGoogle;
 export function getFirebaseStatus(): FirebaseConnectionStatus {
   return initFirebase();
 }
+
 

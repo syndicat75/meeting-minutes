@@ -17,8 +17,11 @@ import {
   CheckCircle2,
   AlertCircle,
   FileEdit,
+  Cloud,
+  HardDrive,
 } from 'lucide-react';
 import { Meeting, MeetingStatus } from '../../types/meeting';
+import { isLocalDraftMeeting } from '../../services/meetingService';
 import { formatKoreanDate } from '../../utils/formatters';
 import { logger } from '../../utils/logger';
 
@@ -54,7 +57,8 @@ export const MeetingCard: React.FC<MeetingCardProps> = ({
   logger.debug('MeetingCard rendered', { meetingId: meeting.id, title: meeting.title });
 
   const statusStyle = STATUS_CONFIG[meeting.status] || STATUS_CONFIG.draft;
-  const isOwner = meeting.ownerId === currentUserId || currentUserId === 'local_user';
+  const isDraft = isLocalDraftMeeting(meeting);
+  const isOwner = meeting.ownerId === currentUserId || isDraft || currentUserId === 'local_user';
 
   // 서명 완료 인원 수 계산
   const signedCount = meeting.attendees.filter((att) => att.signatures && att.signatures.length > 0).length;
@@ -66,15 +70,37 @@ export const MeetingCard: React.FC<MeetingCardProps> = ({
       className="bg-white rounded-xl border border-slate-200 shadow-sm hover:shadow-md hover:border-blue-400 transition-all flex flex-col justify-between overflow-hidden group"
     >
       <div className="p-5 cursor-pointer" onClick={() => onSelect(meeting)}>
-        {/* 상단 메타: 상태 배지 및 날짜 */}
+        {/* 상단 메타: 상태 배지, 저장소 유형 및 날짜 */}
         <div className="flex items-center justify-between gap-2 mb-3">
-          <span
-            className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border ${statusStyle.bg} ${statusStyle.text} ${statusStyle.border}`}
-          >
-            {meeting.status === 'finalized' && <CheckCircle2 className="w-3 h-3 mr-1" />}
-            {meeting.status === 'failed' && <AlertCircle className="w-3 h-3 mr-1" />}
-            {statusStyle.label}
-          </span>
+          <div className="flex items-center space-x-1.5 flex-wrap gap-y-1">
+            <span
+              className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border ${statusStyle.bg} ${statusStyle.text} ${statusStyle.border}`}
+            >
+              {meeting.status === 'finalized' && <CheckCircle2 className="w-3 h-3 mr-1" />}
+              {meeting.status === 'failed' && <AlertCircle className="w-3 h-3 mr-1" />}
+              {statusStyle.label}
+            </span>
+
+            {/* 저장소 위치 표시 배지 (로컬 초안 vs 클라우드 문서) */}
+            {isDraft ? (
+              <span
+                className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-50 text-amber-800 border border-amber-200"
+                title="이 기기의 브라우저 로컬 저장소에 보관된 초안입니다."
+              >
+                <HardDrive className="w-2.5 h-2.5 mr-1 text-amber-600" />
+                로컬 초안
+              </span>
+            ) : (
+              <span
+                className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-50 text-emerald-800 border border-emerald-200"
+                title="Firebase Cloud Firestore에 저장된 문서입니다."
+              >
+                <Cloud className="w-2.5 h-2.5 mr-1 text-emerald-600" />
+                클라우드
+              </span>
+            )}
+          </div>
+
           <span className="text-xs text-slate-500 flex items-center">
             <Calendar className="w-3.5 h-3.5 mr-1 text-slate-400" />
             {formatKoreanDate(meeting.date) || '일자 미정'}

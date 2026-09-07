@@ -5,9 +5,10 @@
  */
 
 import React, { useState } from 'react';
-import { X, Database, ShieldAlert, CheckCircle, ExternalLink, RefreshCw, Save } from 'lucide-react';
+import { X, Database, ShieldAlert, CheckCircle, ExternalLink, RefreshCw, Save, Activity, Loader2 } from 'lucide-react';
 import { FirebaseConnectionStatus } from '../../types/auth';
 import { getFirebaseConfig, STORAGE_KEYS, FirebaseClientConfig } from '../../config/appConfig';
+import { testFirestoreConnection } from '../../services/firebase';
 import { logger } from '../../utils/logger';
 
 interface FirebaseConfigModalProps {
@@ -50,20 +51,66 @@ export const FirebaseConfigModal: React.FC<FirebaseConfigModalProps> = ({
 
   const [activeTab, setActiveTab] = useState<'status' | 'input' | 'guide'>('status');
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isTesting, setIsTesting] = useState<boolean>(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
 
   if (!isOpen) return null;
 
+  // 실제 Firestore 서버 연결 테스트
+  const handleTestConnection = async () => {
+    logger.info('handleTestConnection called');
+    setIsTesting(true);
+    setTestResult(null);
+    try {
+      const res = await testFirestoreConnection();
+      setTestResult(res);
+      onConfigUpdated();
+    } catch (err: any) {
+      setTestResult({ success: false, message: `테스트 실패: ${err?.message || '네트워크 오류'}` });
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  // 공백 제거 및 필수 항목 검증 후 저장
   const handleSave = () => {
     logger.info('Saving custom Firebase config to localStorage');
+    setErrorMessage(null);
+    setSaveMessage(null);
+
+    const trimmedConfig: FirebaseClientConfig = {
+      apiKey: formConfig.apiKey.trim(),
+      authDomain: formConfig.authDomain.trim(),
+      projectId: formConfig.projectId.trim(),
+      storageBucket: formConfig.storageBucket.trim(),
+      messagingSenderId: formConfig.messagingSenderId?.trim() || '',
+      appId: formConfig.appId?.trim() || '',
+      measurementId: formConfig.measurementId?.trim() || '',
+    };
+
+    if (!trimmedConfig.apiKey) {
+      setErrorMessage('API Key(apiKey)는 필수 입력 항목입니다.');
+      return;
+    }
+    if (!trimmedConfig.projectId) {
+      setErrorMessage('Project ID(projectId)는 필수 입력 항목입니다.');
+      return;
+    }
+    if (trimmedConfig.apiKey.includes(' ') || trimmedConfig.projectId.includes(' ')) {
+      setErrorMessage('API Key 또는 Project ID에 공백이 포함될 수 없습니다.');
+      return;
+    }
+
     try {
-      localStorage.setItem(STORAGE_KEYS.FIREBASE_CONFIG_OVERRIDE, JSON.stringify(formConfig));
-      setSaveMessage('Firebase 설정이 저장되었습니다. 페이지가 새로고침됩니다.');
+      localStorage.setItem(STORAGE_KEYS.FIREBASE_CONFIG_OVERRIDE, JSON.stringify(trimmedConfig));
+      setSaveMessage('Firebase 설정이 저장되었습니다. 설정을 적용하기 위해 페이지가 새로고침됩니다.');
       setTimeout(() => {
         window.location.reload();
-      }, 800);
+      }, 900);
     } catch (e: any) {
       logger.error('Failed to save firebase config', e);
-      setSaveMessage(`저장 실패: ${e?.message}`);
+      setErrorMessage(`저장 실패: ${e?.message}`);
     }
   };
 
@@ -140,99 +187,156 @@ export const FirebaseConfigModal: React.FC<FirebaseConfigModalProps> = ({
               <div
                 className={`p-4 rounded-lg border ${
                   status.isConfigured
-                    ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                    ? status.firestoreVerified
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                      : 'bg-blue-50 border-blue-200 text-blue-900'
                     : 'bg-amber-50 border-amber-200 text-amber-900'
                 }`}
               >
                 <div className="flex items-start space-x-3">
-                  {status.isConfigured ? (
+                  {status.firestoreVerified ? (
                     <CheckCircle className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                  ) : status.isConfigured ? (
+                    <Activity className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
                   ) : (
                     <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
                   )}
                   <div>
                     <h4 className="text-sm font-bold">
                       {status.isConfigured
-                        ? `Firebase 클라우드 연동 활성화 (프로젝트: ${status.projectId})`
-                        : 'Firebase 클라우드 미연결 (로컬 안전 모드 동작 중)'}
+                        ? status.firestoreVerified
+                          ? `Firebase 클라우드 연동 완료 (프로젝트: ${status.projectId})`
+                          : `Firebase 설정 등록됨 (서버 검증 대기중: ${status.projectId})`
+                        : 'Firebase 설정 미등록 (로컬 안전 모드로 동작 중)'}
                     </h4>
                     <p className="text-xs mt-1 text-slate-600">
                       {status.isConfigured
-                        ? '모든 회의 데이터, 녹음 파일, 사진 및 전자서명이 Firebase 클라우드 인프라에 안전하게 동기화됩니다.'
-                        : '클라우드 프로젝트 정보가 아직 등록되지 않았습니다. 현재는 브라우저 로컬 저장소(IndexedDB/localStorage) 기반으로 모든 기능을 정상 시연 및 테스트할 수 있습니다.'}
+                        ? status.firestoreVerified
+                          ? '서버 통신이 성공적으로 확인되었습니다. 회의록, 첨부 이미지 및 서명이 클라우드에 안전하게 동기화됩니다.'
+                          : '설정값은 등록되었으나 실제 Firestore 서버 통신이 아직 확인되지 않았습니다. 아래 [서버 접근 테스트 실행] 버튼을 눌러 상태를 진단하세요.'
+                        : '클라우드 프로젝트 정보가 등록되지 않았습니다. 브라우저 로컬 저장소(IndexedDB/localStorage) 기반으로 모든 기능을 정상 시연 및 테스트할 수 있습니다.'}
                     </p>
                   </div>
                 </div>
               </div>
 
-              {/* 세부 서비스 점검 카드 */}
+              {/* 세부 서비스 점검 3단계 카드 */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div className="p-3 border border-slate-200 rounded-lg bg-slate-50">
-                  <span className="text-xs font-bold text-slate-700 block">Firebase Auth</span>
-                  <span className="text-xs text-slate-500">Google 로그인</span>
+                  <span className="text-xs font-bold text-slate-700 block">1. 구성 등록 상태</span>
+                  <span className="text-xs text-slate-500">API Key / Project ID</span>
                   <div className="mt-2 text-xs font-semibold">
-                    {status.authConnected ? (
-                      <span className="text-emerald-600">● 연결 완료</span>
+                    {status.isConfigured ? (
+                      <span className="text-emerald-600">● 설정값 등록됨</span>
                     ) : (
-                      <span className="text-amber-600">○ 로컬 사용자</span>
+                      <span className="text-amber-600">○ 미설정 (로컬)</span>
                     )}
                   </div>
                 </div>
 
                 <div className="p-3 border border-slate-200 rounded-lg bg-slate-50">
-                  <span className="text-xs font-bold text-slate-700 block">Cloud Firestore</span>
-                  <span className="text-xs text-slate-500">회의/참석자/서명/버전</span>
+                  <span className="text-xs font-bold text-slate-700 block">2. Google 계정 인증</span>
+                  <span className="text-xs text-slate-500">Firebase Auth</span>
                   <div className="mt-2 text-xs font-semibold">
-                    {status.firestoreConnected ? (
-                      <span className="text-emerald-600">● 클라우드 동기화</span>
+                    {status.isAuthenticated ? (
+                      <span className="text-emerald-600">● 로그인됨</span>
                     ) : (
-                      <span className="text-amber-600">○ 로컬 스토리지</span>
+                      <span className="text-slate-500">○ 미로그인 (게스트)</span>
                     )}
                   </div>
                 </div>
 
                 <div className="p-3 border border-slate-200 rounded-lg bg-slate-50">
-                  <span className="text-xs font-bold text-slate-700 block">Firebase Storage</span>
-                  <span className="text-xs text-slate-500">녹음/사진/서명 PNG</span>
+                  <span className="text-xs font-bold text-slate-700 block">3. Firestore 서버 검증</span>
+                  <span className="text-xs text-slate-500">실제 읽기/쓰기 검증</span>
                   <div className="mt-2 text-xs font-semibold">
-                    {status.storageConnected ? (
-                      <span className="text-emerald-600">● 원격 버킷 저장</span>
+                    {status.firestoreVerified ? (
+                      <span className="text-emerald-600">● 서버 검증 완료</span>
                     ) : (
-                      <span className="text-amber-600">○ IndexedDB 임시보관</span>
+                      <span className="text-blue-600">○ 미검증</span>
                     )}
                   </div>
                 </div>
               </div>
+
+              {/* 서버 연결 테스트 버튼 및 결과 */}
+              {status.isConfigured && (
+                <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-xs font-bold text-slate-800 block">Firestore 서버 통신 검증</span>
+                      <span className="text-[11px] text-slate-500">네트워크 연결 및 Security Rules 권한을 즉시 테스트합니다.</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleTestConnection}
+                      disabled={isTesting}
+                      className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded text-xs font-semibold disabled:opacity-50 transition-colors"
+                    >
+                      {isTesting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Activity className="w-3.5 h-3.5" />}
+                      <span>{isTesting ? '테스트 중...' : '서버 접근 테스트 실행'}</span>
+                    </button>
+                  </div>
+                  {testResult && (
+                    <div
+                      className={`text-xs p-2.5 rounded border ${
+                        testResult.success
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                          : 'bg-red-50 border-red-200 text-red-800'
+                      }`}
+                    >
+                      {testResult.message}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
           {/* 직접 입력 탭 */}
           {activeTab === 'input' && (
             <div className="space-y-3">
-              <p className="text-xs text-slate-600">
-                Firebase 콘솔의 [프로젝트 설정] &gt; [내 앱] &gt; [웹 앱]에서 복사한 구성을 아래에 입력하면 즉시 연결됩니다.
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Firebase 콘솔의 [프로젝트 설정] &gt; [내 앱] &gt; [웹 앱]에서 복사한 구성을 아래에 입력하세요.
+                저장 시 자동으로 공백이 제거되며 필수 항목(apiKey, projectId)이 검증됩니다.
               </p>
+
+              {errorMessage && (
+                <div className="p-2.5 bg-red-50 border border-red-200 text-red-700 text-xs rounded font-medium">
+                  {errorMessage}
+                </div>
+              )}
+              {saveMessage && (
+                <div className="p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs rounded font-medium">
+                  {saveMessage}
+                </div>
+              )}
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">API Key (apiKey)</label>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    API Key (apiKey) <span className="text-red-500">*</span>
+                  </label>
                   <input
                     type="text"
                     value={formConfig.apiKey}
                     onChange={(e) => setFormConfig({ ...formConfig, apiKey: e.target.value })}
                     placeholder="AIzaSy..."
-                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500"
+                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 font-mono"
                   />
+                  <span className="text-[10px] text-slate-400">주의: Gemini API 키가 아닌 Firebase 웹 앱 apiKey</span>
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">Project ID (projectId)</label>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Project ID (projectId) <span className="text-red-500">*</span>
+                  </label>
                   <input
                     type="text"
                     value={formConfig.projectId}
                     onChange={(e) => setFormConfig({ ...formConfig, projectId: e.target.value })}
                     placeholder="my-safety-project"
-                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500"
+                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 font-mono"
                   />
                 </div>
 
@@ -243,7 +347,7 @@ export const FirebaseConfigModal: React.FC<FirebaseConfigModalProps> = ({
                     value={formConfig.authDomain}
                     onChange={(e) => setFormConfig({ ...formConfig, authDomain: e.target.value })}
                     placeholder="my-safety-project.firebaseapp.com"
-                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500"
+                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 font-mono"
                   />
                 </div>
 
@@ -254,7 +358,7 @@ export const FirebaseConfigModal: React.FC<FirebaseConfigModalProps> = ({
                     value={formConfig.storageBucket}
                     onChange={(e) => setFormConfig({ ...formConfig, storageBucket: e.target.value })}
                     placeholder="my-safety-project.firebasestorage.app"
-                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500"
+                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 font-mono"
                   />
                 </div>
 
@@ -265,7 +369,7 @@ export const FirebaseConfigModal: React.FC<FirebaseConfigModalProps> = ({
                     value={formConfig.appId}
                     onChange={(e) => setFormConfig({ ...formConfig, appId: e.target.value })}
                     placeholder="1:123456789:web:abcdef"
-                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500"
+                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 font-mono"
                   />
                 </div>
 
@@ -276,29 +380,23 @@ export const FirebaseConfigModal: React.FC<FirebaseConfigModalProps> = ({
                     value={formConfig.messagingSenderId}
                     onChange={(e) => setFormConfig({ ...formConfig, messagingSenderId: e.target.value })}
                     placeholder="123456789"
-                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500"
+                    className="w-full text-xs p-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 font-mono"
                   />
                 </div>
               </div>
-
-              {saveMessage && (
-                <div className="p-2 bg-blue-50 border border-blue-200 text-blue-800 text-xs rounded">
-                  {saveMessage}
-                </div>
-              )}
 
               <div className="flex items-center justify-end space-x-2 pt-3 border-t border-slate-200">
                 <button
                   type="button"
                   onClick={handleClear}
-                  className="px-3 py-1.5 text-xs text-slate-600 hover:text-red-600 font-medium"
+                  className="px-3 py-1.5 text-xs text-slate-600 hover:text-red-600 font-medium transition-colors"
                 >
                   설정 초기화
                 </button>
                 <button
                   type="button"
                   onClick={handleSave}
-                  className="flex items-center space-x-1 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded shadow-sm"
+                  className="flex items-center space-x-1 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded shadow-sm transition-colors"
                 >
                   <Save className="w-3.5 h-3.5" />
                   <span>설정 저장 및 적용</span>
