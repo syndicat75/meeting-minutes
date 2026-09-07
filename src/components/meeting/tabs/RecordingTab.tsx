@@ -53,6 +53,7 @@ interface RecordingTabProps {
   isReadOnly: boolean;
   onUpdateMeeting: (partial: Partial<Meeting>) => void;
   onSwitchToTranscriptTab: () => void;
+  onRecordingStateChange?: (isRecording: boolean, durationSeconds: number) => void;
 }
 
 /**
@@ -73,6 +74,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
   isReadOnly,
   onUpdateMeeting,
   onSwitchToTranscriptTab,
+  onRecordingStateChange,
 }) => {
   logger.debug('RecordingTab rendered', { meetingId: meeting.id });
 
@@ -82,6 +84,11 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
   const [recordDuration, setRecordDuration] = useState<number>(
     meeting.recordedDurationSeconds || meeting.recording?.durationSeconds || 0
   );
+
+  // 상위 컴포넌트에 실시간 녹음 상태 알림
+  useEffect(() => {
+    onRecordingStateChange?.(isRecording, recordDuration);
+  }, [isRecording, recordDuration, onRecordingStateChange]);
   // 녹음 완료 후 타이머가 00:00:00으로 리셋되지 않도록 지속 보존하는 상태
   const [lastRecordedDuration, setLastRecordedDuration] = useState<number>(
     meeting.recordedDurationSeconds || meeting.recording?.durationSeconds || 0
@@ -137,12 +144,14 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
     }
     if (meeting.recordedDurationSeconds || meeting.recording?.durationSeconds) {
       const savedDuration = meeting.recordedDurationSeconds || meeting.recording?.durationSeconds || 0;
-      setLastRecordedDuration(savedDuration);
-      if (!isRecording) {
-        setRecordDuration(savedDuration);
+      if (savedDuration > 0) {
+        setLastRecordedDuration((prev) => Math.max(prev, savedDuration));
+        if (!isRecording) {
+          setRecordDuration((prev) => Math.max(prev, savedDuration));
+        }
       }
     }
-  }, [meeting.id, meeting.audioChunks, meeting.recordedDurationSeconds, meeting.recording?.durationSeconds]);
+  }, [meeting.id, meeting.audioChunks, meeting.recordedDurationSeconds, meeting.recording?.durationSeconds, isRecording]);
 
   // 언마운트 시 활성 녹음 정리
   useEffect(() => {
@@ -328,29 +337,35 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
     setIsFinalizing(true);
     setErrorMessage(null);
 
+    // 정지 직전까지 녹음된 시간(초) 확보
+    const durationAtStop = Math.max(recordDuration, 1);
+
     try {
       const { totalDurationSeconds } = await recorderRef.current.stop();
 
-      // 녹음 종료 후에도 메인 타이머 시간(초) 보존
-      setRecordDuration(totalDurationSeconds);
-      setLastRecordedDuration(totalDurationSeconds);
+      // 녹음 종료 후에도 메인 타이머 시간(초) 보존 (절대 0으로 초기화되지 않음)
+      const finalDuration = Math.max(durationAtStop, totalDurationSeconds, 1);
+      setRecordDuration(finalDuration);
+      setLastRecordedDuration(finalDuration);
       setIsRecording(false);
       setIsPaused(false);
 
       const latestChunks = await getMeetingAudioChunks(meeting.id);
-      setChunks(latestChunks);
+      // 로컬 청크 상태가 있을 경우 빈 배열로 덮어쓰지 않도록 안전 병합
+      const resolvedChunks = (latestChunks && latestChunks.length > 0) ? latestChunks : chunks;
+      setChunks(resolvedChunks);
 
-      const totalBytes = latestChunks.reduce((acc, c) => acc + (c.size || c.fileSizeBytes || 0), 0);
-      const upCount = latestChunks.filter((c) => c.uploadStatus === 'uploaded').length;
-      const failCount = latestChunks.filter((c) => c.uploadStatus === 'failed').length;
+      const totalBytes = resolvedChunks.reduce((acc, c) => acc + (c.size || c.fileSizeBytes || 0), 0);
+      const upCount = resolvedChunks.filter((c) => c.uploadStatus === 'uploaded').length;
+      const failCount = resolvedChunks.filter((c) => c.uploadStatus === 'failed').length;
 
-      const firstUploaded = latestChunks.find((c) => c.uploadStatus === 'uploaded');
+      const firstUploaded = resolvedChunks.find((c) => c.uploadStatus === 'uploaded');
 
       const metadata: RecordingMetadata = {
         id: 'rec_' + Date.now(),
-        storagePath: firstUploaded?.storagePath || latestChunks[0]?.storagePath || '',
-        downloadUrl: firstUploaded?.downloadUrl,
-        durationSeconds: totalDurationSeconds,
+        storagePath: firstUploaded?.storagePath || resolvedChunks[0]?.storagePath || '',
+        downloadUrl: firstUploaded?.downloadUrl || resolvedChunks[0]?.downloadUrl,
+        durationSeconds: finalDuration,
         fileSizeBytes: totalBytes,
         mimeType: 'audio/webm',
         fileName: `회의녹음_${meeting.date || '회의'}.webm`,
@@ -360,16 +375,16 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
 
       onUpdateMeeting({
         recording: metadata,
-        recordedDurationSeconds: totalDurationSeconds,
+        recordedDurationSeconds: finalDuration,
         recordingStatus: 'completed',
-        audioChunks: latestChunks,
+        audioChunks: resolvedChunks,
         uploadedChunksCount: upCount,
-        totalChunksCount: latestChunks.length,
+        totalChunksCount: resolvedChunks.length,
       });
 
       if (failCount > 0) {
         setErrorMessage(
-          `전체 ${latestChunks.length}개 구간 중 ${failCount}개 구간의 클라우드 저장에 실패했습니다. 아래 [저장 재시도] 버튼을 눌러 다시 저장해주세요.`
+          `전체 ${resolvedChunks.length}개 구간 중 ${failCount}개 구간의 클라우드 저장에 실패했습니다. 아래 [저장 재시도] 버튼을 눌러 다시 저장하거나, 즉시 AI 전사를 진행하실 수 있습니다.`
         );
       } else {
         logger.info('Recording stopped and all chunks finalized successfully');
@@ -609,14 +624,15 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
   // 표시할 타이머 시간(초) - 녹음 중지 후에도 00:00:00 리셋 방지
   const displayDurationSeconds = isRecording
     ? recordDuration
-    : (lastRecordedDuration ||
-       recordDuration ||
-       meeting.recordedDurationSeconds ||
-       meeting.recording?.durationSeconds ||
-       chunks.reduce((acc, c) => acc + (c.durationSeconds || c.duration || 0), 0) ||
-       0);
+    : Math.max(
+        lastRecordedDuration,
+        recordDuration,
+        meeting.recordedDurationSeconds || 0,
+        meeting.recording?.durationSeconds || 0,
+        chunks.reduce((acc, c) => acc + (c.durationSeconds || c.duration || 0), 0)
+      );
 
-  // 상단 상태 문구 결정 함수 (상태 불일치 100% 방지)
+  // 상단 상태 문구 결정 함수 (상단-하단 통일: "저장: X/Y 완료")
   const getStatusText = () => {
     if (isRecording && !isPaused) {
       return `실시간 녹음 중 (현재 제${activeChunkIndex}구간)`;
@@ -628,16 +644,13 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
       return '녹음 완료 및 마지막 구간 클라우드 저장 중...';
     }
     if (failedUploadChunksCount > 0) {
-      return `녹음 저장 실패 (${uploadedChunksCount}/${totalChunksCount} 구간 저장 완료, ${failedUploadChunksCount}개 실패)`;
+      return `저장: ${uploadedChunksCount}/${totalChunksCount} 완료 (${failedUploadChunksCount}개 저장 실패)`;
     }
     if (uploadingChunksCount > 0) {
-      return `녹음 구간 클라우드 저장 진행 중 (${uploadedChunksCount}/${totalChunksCount})`;
+      return `저장: ${uploadedChunksCount}/${totalChunksCount} 진행 중...`;
     }
     if (totalChunksCount > 0) {
-      if (uploadedChunksCount === totalChunksCount) {
-        return `${uploadedChunksCount}개 구간 저장 완료`;
-      }
-      return `${uploadedChunksCount}/${totalChunksCount}개 구간 저장 완료`;
+      return `저장: ${uploadedChunksCount}/${totalChunksCount} 완료`;
     }
     return '녹음 대기 중';
   };
@@ -754,7 +767,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
             >
               <Layers className="w-3.5 h-3.5" />
               <span>
-                {uploadedChunksCount} / {totalChunksCount} 구간 저장 완료 (5분 자동 분할)
+                저장: {uploadedChunksCount}/{totalChunksCount} 완료 (5분 자동 분할)
                 {failedUploadChunksCount > 0 && ` • ${failedUploadChunksCount}구간 저장 실패`}
               </span>
             </div>
@@ -960,13 +973,36 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
 
           {/* 저장 실패 경고 알림 */}
           {failedUploadChunksCount > 0 && !isRecording && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center justify-between text-xs text-red-800">
-              <span className="flex items-center">
-                <AlertTriangle className="w-4 h-4 text-red-600 mr-2 shrink-0" />
-                <span>
-                  클라우드 저장에 실패한 구간({failedUploadChunksCount}개)이 있습니다. AI 전사를 진행하려면 각 구간의 <strong>[저장 재시도]</strong>를 먼저 완료해야 합니다.
+            <div className="p-3.5 bg-red-50 border border-red-200 rounded-lg space-y-2 text-xs text-red-800">
+              <div className="flex items-center justify-between">
+                <span className="flex items-center font-bold">
+                  <AlertTriangle className="w-4 h-4 text-red-600 mr-2 shrink-0" />
+                  <span>
+                    클라우드 저장에 실패한 구간({failedUploadChunksCount}개)이 있습니다.
+                  </span>
                 </span>
-              </span>
+                {chunks.some((c) => c.errorCode === 'storage/unauthorized') && (
+                  <span className="px-2 py-0.5 bg-red-100 text-red-700 font-mono rounded text-[11px] font-semibold">
+                    HTTP 403 권한 오류
+                  </span>
+                )}
+              </div>
+              {chunks.some((c) => c.errorCode === 'storage/unauthorized') ? (
+                <div className="text-[11px] text-red-700 leading-relaxed bg-white/70 p-2.5 rounded border border-red-100 space-y-1">
+                  <p className="font-semibold text-red-900">
+                    Firebase Storage 저장 권한이 없습니다 (HTTP 403 storage/unauthorized).
+                  </p>
+                  <p className="text-slate-600">
+                    • Firebase Console &gt; Build &gt; Storage &gt; Rules 탭에 <code>storage.rules</code> 규칙이 게시(Publish)되었는지 확인해주세요.
+                    <br />
+                    • 브라우저 콘솔에서 <code>[firebase-diagnostics]</code> 로그(projectId, storageBucket, source) 및 <code>[storage-auth]</code>를 확인해주세요.
+                  </p>
+                </div>
+              ) : (
+                <p className="text-[11px] text-slate-600">
+                  AI 전사를 진행하려면 각 구간의 <strong>[저장 재시도]</strong>를 먼저 완료해야 합니다.
+                </p>
+              )}
             </div>
           )}
 
@@ -1051,7 +1087,9 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                         ) : isChunkUploadFailed ? (
                           <span className="inline-flex items-center text-red-600 font-semibold">
                             <AlertTriangle className="w-3 h-3 mr-1" />
-                            업로드 실패
+                            {chunk.errorCode === 'storage/unauthorized'
+                              ? 'Firebase Storage 저장 권한이 없습니다.'
+                              : chunk.errorMessage || '업로드 실패'}
                           </span>
                         ) : (
                           <span className="inline-flex items-center text-green-700">
@@ -1082,6 +1120,25 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                           <span className="text-slate-400">전사 대기</span>
                         )}
                       </div>
+
+                      {/* 관리자 진단 영역 (storage/unauthorized, HTTP 403, storagePath) */}
+                      {isChunkUploadFailed && (
+                        <div className="mt-1 flex items-center gap-1.5 text-[10px] font-mono text-slate-500 flex-wrap">
+                          <span className="px-1.5 py-0.5 bg-red-100 text-red-800 rounded border border-red-200">
+                            {chunk.errorCode || 'storage/unauthorized'}
+                          </span>
+                          {(chunk.errorCode === 'storage/unauthorized' || chunk.errorMessage?.includes('권한')) && (
+                            <span className="px-1.5 py-0.5 bg-amber-100 text-amber-900 rounded border border-amber-200 font-bold">
+                              HTTP 403
+                            </span>
+                          )}
+                          {chunk.storagePath && (
+                            <span className="text-slate-400 truncate max-w-[280px]" title={chunk.storagePath}>
+                              {chunk.storagePath}
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
 

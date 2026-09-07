@@ -28,7 +28,7 @@ import {
   MeetingContentRow,
   ActionItem,
 } from '../../../types/meeting';
-import { requestMeetingSummary } from '../../../services/aiService';
+import { requestComprehensiveMeetingSummary } from '../../../services/transcriptionClientService';
 import { logger } from '../../../utils/logger';
 
 interface SummaryTabProps {
@@ -62,12 +62,20 @@ export const SummaryTab: React.FC<SummaryTabProps> = ({
   const [newContent, setNewContent] = useState('');
 
   /**
-   * AI 요약 생성/재생성 트리거
+   * AI 요약 생성/재생성 트리거 (대화록 또는 직접 작성 회의록 컨텍스트 종합 활용)
    */
   const handleGenerateSummary = async () => {
     logger.info('handleGenerateSummary called');
-    if (!meeting.transcripts || meeting.transcripts.length === 0) {
-      setGenerateError('요약을 생성하려면 먼저 대화록이 존재해야 합니다.');
+
+    const hasTranscripts = Boolean(meeting.transcripts && meeting.transcripts.length > 0);
+    const hasManualEntries = Boolean(meeting.manualEntries && meeting.manualEntries.length > 0);
+    const hasFreeformMemo = Boolean(meeting.freeformMemo && meeting.freeformMemo.trim().length > 0);
+    const hasAnyContent = hasTranscripts || hasManualEntries || hasFreeformMemo;
+
+    if (!hasAnyContent) {
+      setGenerateError(
+        '요약을 생성하려면 대화록 또는 [직접 작성] 탭에서 입력한 회의 내용(발언 또는 메모)이 필요합니다.'
+      );
       return;
     }
 
@@ -75,15 +83,22 @@ export const SummaryTab: React.FC<SummaryTabProps> = ({
     setGenerateError(null);
 
     try {
-      const summary = await requestMeetingSummary({
-        meetingId: meeting.id,
-        meetingTitle: meeting.title,
-        agenda: meeting.agenda,
-        department: meeting.department,
-        attendees: meeting.attendees,
-        transcripts: meeting.transcripts,
-        speakerMapping: meeting.speakerMapping || {},
-      });
+      const summary = await requestComprehensiveMeetingSummary(
+        meeting.id,
+        {
+          title: meeting.title,
+          agenda: meeting.agenda,
+          department: meeting.department,
+          date: meeting.date,
+          attendees: meeting.attendees,
+        },
+        meeting.transcripts || [],
+        {
+          manualEntries: meeting.manualEntries,
+          freeformMemo: meeting.freeformMemo,
+          manualActionItems: meeting.manualActionItems,
+        }
+      );
 
       // 기존 사용자 수정본이 이미 존재하는 경우 조용히 덮어쓰지 않고 비교 모달 제공
       if (meeting.summary || (meeting.contentRows && meeting.contentRows.length > 0)) {

@@ -384,8 +384,85 @@ AI 일괄 전사 요청 (동시 2개 청크 제한 워커 풀로 순차/병렬 �
    - 녹음 종료 후 `recordDuration`이 리셋되더라도 실제 녹음된 전체 시간(`totalDurationSeconds`)을 `lastRecordedDuration` 및 `meeting.recordedDurationSeconds`에 저장/보존하여, 28초 녹음 완료 후 타이머가 사라지지 않고 온전히 유지되도록 개선했습니다.
 7. **미저장 구간 존재 시 AI 전사 버튼 비활성화**:
    - 클라우드 Storage에 업로드되지 않은 청크가 하나라도 있을 경우 AI 전사 버튼(`btn-batch-transcribe`)을 비활성화하고, 명확한 안내 툴팁과 [저장 재시도] 안내 배너를 제공합니다.
-8. **클라우드 스토리지 쓰기 권한 사전 확인**:
-   - Google 로그인이 되어 있지 않은 상태에서 녹음이 시작되어 추후 Storage 쓰기 권한 오류가 발생하는 것을 사전에 방지하기 위해, 녹음 시작 시 로그인 상태를 먼저 확인하고 안내합니다.
+8. **클라우드 스토리지 쓰기 권한 사전 확인 및 로컬 폴백**:
+   - Google 로그인이 되어 있지 않거나 Storage 미설정 상태인 경우에도, 로컬 IndexedDB에 안전하게 청크를 보존하고 `URL.createObjectURL`을 통한 로컬 오디오 재생 및 분석을 지원합니다.
+9. **Firestore + 로컬 IndexedDB 통합 복원 (`getMeetingAudioChunks`)**:
+   - Firestore 조회가 실패하거나 오프라인/지연 상태인 경우 로컬 IndexedDB의 5분 청크 Blob을 자동 복원 병합하여, 녹음 직후 청크 목록이 비어 보이거나 상태가 누락되는 현상을 완벽히 방지했습니다.
+
+---
+
+## 10. 직접 작성 회의록 아키텍처 (Manual Entry Architecture)
+
+### 10.1. 기본 목적 및 설계 원칙
+사용자는 회의 내용을 다음 3가지 방식으로 유연하게 기록할 수 있으며, 상호 배타적이지 않고 자유롭게 조합할 수 있습니다:
+1. **마이크 녹음 → AI 화자분리 전사**
+2. **기존 음성파일 업로드 → AI 화자분리 전사**
+3. **사람이 직접 키보드로 회의내용 입력 (Manual Entry)**
+
+> **핵심 원칙**: 음성 녹음이나 파일이 전혀 없더라도 사람이 직접 입력한 회의내용만으로 회의록 작성, AI 요약, 결정사항 정리, Action Item 작성, 전자서명, 최종 확정, 인쇄/PDF까지 모든 법적·실무적 회의록 절차를 100% 완료할 수 있습니다.
+
+### 10.2. 데이터 모델 (`src/types/meeting.ts`)
+- `ManualEntry`: 개별 직접 작성 항목 (작성시각, 작성자, 발언자, 발언내용, 태그/구분)
+- `ManualActionItem`: 직접 등록한 후속 조치 과제 (업무명, 담당자, 마감일, 우선순위, 완료 여부)
+- `Meeting.manualMinutes`: 직접 작성 회의록 전용 구조체
+  - `entries`: ManualEntry[]
+  - `decisions`: string[] (직접 작성한 결정사항)
+  - `actionItems`: ManualActionItem[] (직접 작성한 Action Item)
+  - `generalNotes`: string (자유 메모)
+  - `source`: `'manual'`
+  - `lastEditedAt`: 수정 일시
+
+### 10.3. AI 전사와의 상호작용 및 데이터 보호 원칙
+1. **사용자 직접 작성 내용 절대 보호 (Immutable Manual Data)**:
+   - AI 전사나 AI 요약을 재실행하더라도 사용자가 직접 타이핑한 `manualMinutes`는 절대로 덮어써지거나 삭제되지 않습니다.
+   - 출처 태그(`source: 'manual' | 'ai_transcription'`)를 엄격히 분리 관리합니다.
+2. **통합 타임라인 제공 (`TranscriptTab.tsx`)**:
+   - 사용자는 대화록 화면에서 [전체 보기], [녹음 AI 전사만], [직접 작성 메모만] 필터를 통해 발언을 선택적으로 조회할 수 있습니다.
+   - 타임스탬프 순서대로 자연스럽게 녹음 발언과 사용자 직접 메모가 어우러져 표시됩니다.
+3. **직접 작성 내용 기반 AI 지능형 요약 (`server/ai/meetingSummaryService.ts`)**:
+   - 음성 녹음이 없더라도 직접 작성된 메모, 결정사항, Action Items를 종합하여 Gemini AI가 표준 양식의 구조화된 요약본을 도출합니다.
+   - 음성과 직접 작성이 모두 존재하는 경우, 두 가지 맥락을 모두 수렴하여 더욱 완전한 회의록 요약을 완성합니다.
+4. **최종 확정 및 인쇄 연동 (`FinalizePrintTab.tsx`)**:
+   - A4 출력 및 PDF 인쇄 시에도 [직접 작성 회의내용] 섹션과 [직접 지정 Action Item]이 표준 공문서 규격에 맞게 유려하게 렌더링됩니다.
+
+---
+
+## 11. Firebase Storage 403 오류 진단 및 보안 규칙 아키텍처 (Storage 403 Diagnostics & Security Rules)
+
+### 11.1. HTTP 403 (storage/unauthorized) 발생 메커니즘 및 원인 분석
+브라우저 환경에서 장시간 녹음 오디오 청크 업로드 시 발생하는 `HTTP 403 Forbidden` (`storage/unauthorized`) 오류는 다음 4가지 원인에 의해 발생합니다:
+1. **Firebase 설정 소스 불일치 (localStorage override Mismatch)**:
+   - 사용자가 이전에 `FirebaseConfigModal` 등을 통해 브라우저 `localStorage`(`ai_meeting_firebase_config_override`)에 입력했던 과거 프로젝트 정보(`projectId`, `storageBucket`, `authDomain`)가 환경 변수와 충돌하거나, 현재 로그인 세션의 Auth Project ID와 Storage Bucket Project ID가 서로 다를 때 토큰 검증 실패로 403 발생.
+2. **Firebase Storage 보안 규칙(Security Rules) 미게시 또는 미배포**:
+   - Firebase Storage 생성 시 기본 규칙은 `allow read, write: if false;`로 설정되어 있어, Firebase Console에 `storage.rules`가 배포(Publish)되지 않았을 경우 모든 쓰기 요청이 거절됨.
+3. **비인증 상태(`auth.currentUser === null`)에서 업로드 시도**:
+   - 규칙상 `request.auth != null`을 요구하지만 사용자 로그인 세션이 준비되지 않은 상태에서 업로드를 시도한 경우.
+4. **경로 매칭 불일치 또는 MIME Content-Type 제약**:
+   - 실제 업로드 경로(`meetings/{meetingId}/audio/chunks/{fileName}`)와 Security Rules의 패턴이 일치하지 않거나, 브라우저 WebM codec(`audio/webm;codecs=opus`) 등의 Content-Type 매칭 실패.
+
+### 11.2. 진단 및 보안 하드닝 구현 내역
+1. **런타임 Firebase 파라미터 진단 로깅 (`src/config/appConfig.ts`)**:
+   - `getFirebaseConfigWithSource()`를 통해 현재 활성화된 설정의 소스(`'localStorage'` 또는 `'environment'`)를 실시간 식별.
+   - API 키 전체 값은 절대 노출하지 않고 다음 안전한 진단 로그를 브라우저 콘솔에 자동 출력:
+     ```ts
+     console.log('[firebase-diagnostics]', { projectId, authDomain, storageBucket, source });
+     ```
+2. **업로드 전 인증 상태 사전 검증 (`src/services/storageService.ts`)**:
+   - 업로드 시도 직전 다음 진단 로그 출력:
+     ```ts
+     console.log('[storage-auth]', { uid: auth.currentUser?.uid ?? null, hasUser: !!auth.currentUser });
+     console.log('[storage-upload-path]', { storagePath });
+     ```
+   - `auth.currentUser`가 `null`인 경우 Storage 업로드를 원천 차단하여 불필요한 403 에러 발생을 방지하고, 로컬 임시 Object URL 및 IndexedDB로 안전하게 폴백.
+3. **403 오류 자동 재시도 원천 차단 (Fast Fail Policy)**:
+   - 네트워크 장애나 타임아웃, 5xx 서버 에러는 지수 백오프(2초, 5초, 10초)로 재시도하지만, 403 (`storage/unauthorized`, `storage/unauthenticated`, `storage/no-default-bucket`)은 시간 경과로 해결되지 않으므로 즉시 재시도를 중단(`break`).
+4. **스토리지 보안 규칙 (`storage.rules`) 명시적 청크 경로 반영**:
+   - `meetings/{meetingId}/audio/chunks/{fileName}` 명시적 경로 규칙과 `audio/{allPaths=**}` 규칙을 완비하여 인증된 사용자(`request.auth != null`)의 오디오 청크 저장을 보장.
+5. **UI 진단 및 사용자 에러 가이드 (`RecordingTab.tsx` & `FirebaseConfigModal.tsx`)**:
+   - 403 오류 발생 시 일반적인 "업로드 실패" 대신 "Firebase Storage 저장 권한이 없습니다. (HTTP 403)"로 명확히 고지.
+   - 관리자 진단 영역에 `storage/unauthorized`, `HTTP 403`, `storagePath`를 모노스페이스 폰트로 정밀하게 표시.
+   - `localStorage override`가 활성화된 경우 원클릭 [기본 설정으로 초기화] 버튼을 제공하여 프로젝트 불일치를 신속히 해소.
+
 
 
 

@@ -5,11 +5,20 @@
  * 이미 성공한 구간은 재전사하지 않고 실패 구간만 부분 재시도할 수 있도록 보장합니다.
  */
 
-import { AudioChunk, TranscriptSegment, MeetingSummary, StructuredActionItem } from '../types/meeting';
+import { AudioChunk, TranscriptSegment, MeetingSummary, StructuredActionItem, ManualEntry, ManualActionItem } from '../types/meeting';
 import { updateChunkTranscriptionStatus } from './audioChunkService';
 import { getFirebaseIdToken } from './firebase';
 import { logger } from '../utils/logger';
 import { APP_CONFIG } from '../config/appConfig';
+
+/**
+ * 요약 생성 시 통합할 추가 사용자 작성 컨텍스트 인터페이스
+ */
+export interface ComprehensiveSummaryExtraContext {
+  manualEntries?: ManualEntry[];
+  freeformMemo?: string;
+  manualActionItems?: ManualActionItem[];
+}
 
 /**
  * 전사 진행 상황 콜백 인터페이스
@@ -312,11 +321,15 @@ export async function requestComprehensiveMeetingSummary(
     date?: string;
     attendees?: Array<{ name: string; role?: string; position?: string }>;
   },
-  transcripts: TranscriptSegment[]
+  transcripts: TranscriptSegment[],
+  extraContext?: ComprehensiveSummaryExtraContext
 ): Promise<MeetingSummary> {
   logger.info('requestComprehensiveMeetingSummary called', {
     meetingId,
-    segmentCount: transcripts.length,
+    segmentCount: transcripts?.length || 0,
+    manualEntriesCount: extraContext?.manualEntries?.length || 0,
+    hasFreeformMemo: Boolean(extraContext?.freeformMemo),
+    manualActionItemsCount: extraContext?.manualActionItems?.length || 0,
   });
 
   const token = await getFirebaseIdToken();
@@ -324,9 +337,47 @@ export async function requestComprehensiveMeetingSummary(
     throw new Error('인증 토큰이 없습니다.');
   }
 
-  const fullTranscript = transcripts
-    .map((s) => `[${formatSecondsToTime(s.startSeconds)}] ${s.speakerName || s.speakerId}: ${s.text}`)
-    .join('\n');
+  const transcriptLines: string[] = [];
+
+  // 1. AI 전사 발언
+  if (transcripts && transcripts.length > 0) {
+    transcriptLines.push('--- [AI 음성 전사 대화록] ---');
+    for (const s of transcripts) {
+      transcriptLines.push(`[${formatSecondsToTime(s.startSeconds)}] ${s.speakerName || s.speakerId}: ${s.text}`);
+    }
+  }
+
+  // 2. 사람이 직접 키보드로 작성한 발언 (공식 회의록 포함 대상만)
+  if (extraContext?.manualEntries && extraContext.manualEntries.length > 0) {
+    const officialEntries = extraContext.manualEntries.filter((e) => e.isOfficial);
+    if (officialEntries.length > 0) {
+      transcriptLines.push('\n--- [사람이 직접 입력한 회의 발언] ---');
+      for (const e of officialEntries) {
+        const timeStr = typeof e.timestampSeconds === 'number' ? `[${formatSecondsToTime(e.timestampSeconds)}] ` : '';
+        const star = e.isImportant ? ' ⭐[중요]' : '';
+        transcriptLines.push(`${timeStr}${e.speakerName}${star}: ${e.text}`);
+      }
+    }
+  }
+
+  // 3. 공식 회의 메모
+  if (extraContext?.freeformMemo && extraContext.freeformMemo.trim()) {
+    transcriptLines.push('\n--- [회의 중 직접 작성한 메모] ---');
+    transcriptLines.push(extraContext.freeformMemo.trim());
+  }
+
+  // 4. 직접 등록한 Action Item
+  if (extraContext?.manualActionItems && extraContext.manualActionItems.length > 0) {
+    transcriptLines.push('\n--- [직접 지정한 후속 조치 과제(Action Items)] ---');
+    for (const a of extraContext.manualActionItems) {
+      transcriptLines.push(`- ${a.task} (담당: ${a.assignee || '미지정'}, 기한: ${a.dueDate || '미지정'})`);
+    }
+  }
+
+  const fullTranscript = transcriptLines.join('\n').trim();
+  if (!fullTranscript) {
+    throw new Error('요약할 회의 내용이 없습니다. 대화록을 전사하거나 직접 발언/메모를 입력해주세요.');
+  }
 
   const response = await fetch('/api/ai/summarize-meeting', {
     method: 'POST',

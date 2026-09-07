@@ -162,9 +162,9 @@ export function initFirebase(): FirebaseConnectionStatus {
 
     authInstance = getAuth(appInstance);
     firestoreInstance = getFirestore(appInstance);
-    // storageBucket 명시 바인딩 (gs:// 접두사 포함 또는 프로젝트 기본값)
-    const bucketParam = config.storageBucket ? `gs://${config.storageBucket}` : undefined;
-    storageInstance = bucketParam ? getStorage(appInstance, bucketParam) : getStorage(appInstance);
+    // storageBucket 명시 바인딩 (gs:// 중복 접두사 방지 및 안전한 버킷 바인딩)
+    const cleanBucket = config.storageBucket ? config.storageBucket.replace(/^gs:\/\//, '').trim() : '';
+    storageInstance = cleanBucket ? getStorage(appInstance, `gs://${cleanBucket}`) : getStorage(appInstance);
 
     const isAuthed = Boolean(authInstance?.currentUser);
 

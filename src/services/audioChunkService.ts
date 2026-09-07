@@ -22,6 +22,7 @@ import {
   save5MinChunkBlob,
   get5MinChunkBlob,
   mark5MinChunkUploaded,
+  getAll5MinChunks,
 } from './indexedDbAudio';
 
 /**
@@ -134,10 +135,12 @@ export async function processAndUploadAudioChunk(
 
   // 4. Firebase Storage에 직접 업로드 (지수 백오프 3회 자동 재시도 포함)
   try {
-    const { downloadUrl } = await uploadAudioChunkToStorage(meetingId, normalizedChunkId, blob, mimeType);
+    const uploadResult = await uploadAudioChunkToStorage(meetingId, normalizedChunkId, blob, mimeType);
+    const { downloadUrl, storagePath: returnedStoragePath } = uploadResult;
 
     chunkData.uploadStatus = 'uploaded';
     chunkData.downloadUrl = downloadUrl;
+    chunkData.storagePath = returnedStoragePath || storagePath;
     chunkData.errorMessage = undefined;
 
     // Firestore에 업로드 완료 상태 갱신 (Storage 성공 후에만 'uploaded' 기록)
@@ -148,6 +151,7 @@ export async function processAndUploadAudioChunk(
         {
           uploadStatus: 'uploaded',
           downloadUrl,
+          storagePath: returnedStoragePath || storagePath,
           errorMessage: null,
           updatedAt: new Date().toISOString(),
         },
@@ -167,11 +171,20 @@ export async function processAndUploadAudioChunk(
     logger.info('Audio chunk upload fully succeeded', { chunkId: normalizedChunkId, storagePath });
     return chunkData;
   } catch (uploadErr: any) {
-    const errorMessage = uploadErr?.message || 'Storage 업로드에 실패했습니다.';
+    const is403 =
+      uploadErr?.code === 'storage/unauthorized' ||
+      uploadErr?.code === 'storage/unauthenticated' ||
+      uploadErr?.httpStatus === 403 ||
+      String(uploadErr?.message || '').includes('권한') ||
+      String(uploadErr?.message || '').includes('403');
+
+    const friendlyErrorMessage = is403
+      ? 'Firebase Storage 저장 권한이 없습니다.'
+      : (uploadErr?.message || 'Storage 업로드에 실패했습니다.');
 
     // 요구사항: catch에서 오류를 숨기지 말고 console.error에 상세 기록
     console.error('[audio-chunk-upload]', {
-      code: uploadErr?.code,
+      code: uploadErr?.code || (is403 ? 'storage/unauthorized' : 'storage/failed'),
       message: uploadErr?.message,
       name: uploadErr?.name,
       meetingId,
@@ -179,10 +192,18 @@ export async function processAndUploadAudioChunk(
       storagePath,
       blobSize: blob.size,
       mimeType,
+      is403,
     });
 
     chunkData.uploadStatus = 'failed';
-    chunkData.errorMessage = errorMessage;
+    chunkData.errorCode = uploadErr?.code || (is403 ? 'storage/unauthorized' : 'storage/failed');
+    chunkData.errorMessage = friendlyErrorMessage;
+    // 실패하더라도 IndexedDB에 저장된 원본 오디오를 바로 들을 수 있도록 Object URL 생성 부여
+    try {
+      chunkData.downloadUrl = URL.createObjectURL(blob);
+    } catch {
+      // 무시
+    }
 
     try {
       const chunkRef = getChunkDocRef(meetingId, normalizedChunkId);
@@ -190,7 +211,8 @@ export async function processAndUploadAudioChunk(
         chunkRef,
         {
           uploadStatus: 'failed',
-          errorMessage,
+          errorMessage: friendlyErrorMessage,
+          errorCode: chunkData.errorCode,
           updatedAt: new Date().toISOString(),
         },
         { merge: true }
@@ -325,24 +347,67 @@ export async function retryFailedChunkUpload(
 export const retryFailedAudioChunk = retryFailedChunkUpload;
 
 /**
- * 특정 회의의 모든 청크 목록 조회
+ * 특정 회의의 모든 청크 목록 조회 (Firestore + 로컬 IndexedDB 통합 복원)
  * @param meetingId 회의 ID
  * @returns {Promise<AudioChunk[]>} 청크 목록 (인덱스 순)
  */
 export async function getMeetingAudioChunks(meetingId: string): Promise<AudioChunk[]> {
   logger.info('getMeetingAudioChunks called', { meetingId });
+  const firestoreChunks: AudioChunk[] = [];
   try {
     const q = query(getChunksCollectionRef(meetingId), orderBy('index', 'asc'));
     const snapshot = await getDocs(q);
-    const chunks: AudioChunk[] = [];
     snapshot.forEach((docSnap) => {
-      chunks.push(docSnap.data() as AudioChunk);
+      firestoreChunks.push(docSnap.data() as AudioChunk);
     });
-    return chunks;
   } catch (err) {
-    logger.warn('Failed to get chunks from Firestore', { meetingId, error: String(err) });
-    return [];
+    logger.warn('Failed to get chunks from Firestore, falling back to IndexedDB', { meetingId, error: String(err) });
   }
+
+  // 로컬 IndexedDB 청크와 병합하여 오프라인/미설정/지연 환경에서도 데이터 보존
+  try {
+    const local5MinChunks = await getAll5MinChunks(meetingId);
+    if (local5MinChunks && local5MinChunks.length > 0) {
+      const mergedMap = new Map<string, AudioChunk>();
+      // 로컬 데이터를 우선 매핑
+      for (const loc of local5MinChunks) {
+        const id = loc.chunkId;
+        const blobUrl = URL.createObjectURL(loc.blob);
+        mergedMap.set(id, {
+          id,
+          meetingId,
+          index: loc.index,
+          storagePath: `meetings/${meetingId}/audio/chunks/${id}.webm`,
+          downloadUrl: blobUrl,
+          startSeconds: loc.startSeconds,
+          endSeconds: loc.endSeconds,
+          duration: Math.max(1, loc.endSeconds - loc.startSeconds),
+          durationSeconds: Math.max(1, loc.endSeconds - loc.startSeconds),
+          size: loc.blob.size,
+          fileSizeBytes: loc.blob.size,
+          mimeType: loc.mimeType,
+          uploadStatus: loc.isUploaded ? 'uploaded' : 'failed',
+          transcriptionStatus: 'pending',
+          transcriptionAttempts: 0,
+          createdAt: loc.createdAt,
+        });
+      }
+      // Firestore에 등록된 메타데이터가 있으면 덮어씌움 (단, downloadUrl이 없으면 로컬 Blob URL 보존)
+      for (const fc of firestoreChunks) {
+        const existing = mergedMap.get(fc.id);
+        mergedMap.set(fc.id, {
+          ...existing,
+          ...fc,
+          downloadUrl: fc.downloadUrl || existing?.downloadUrl,
+        });
+      }
+      return Array.from(mergedMap.values()).sort((a, b) => a.index - b.index);
+    }
+  } catch (idbErr) {
+    logger.warn('Failed to read from IndexedDB for getMeetingAudioChunks', idbErr);
+  }
+
+  return firestoreChunks;
 }
 
 /**

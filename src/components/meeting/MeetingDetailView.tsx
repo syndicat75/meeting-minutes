@@ -10,6 +10,7 @@ import {
   ArrowLeft,
   Info,
   Mic,
+  Keyboard,
   MessageSquareText,
   FileText,
   Image as ImageIcon,
@@ -22,6 +23,7 @@ import {
 import { Meeting } from '../../types/meeting';
 import { BasicInfoTab } from './tabs/BasicInfoTab';
 import { RecordingTab } from './tabs/RecordingTab';
+import { ManualEntryTab } from './tabs/ManualEntryTab';
 import { TranscriptTab } from './tabs/TranscriptTab';
 import { SummaryTab } from './tabs/SummaryTab';
 import { PhotosTab } from './tabs/PhotosTab';
@@ -37,7 +39,7 @@ interface MeetingDetailViewProps {
   onSaveMeeting: (meeting: Meeting) => Promise<void>;
 }
 
-type TabKey = 'basic' | 'recording' | 'transcript' | 'summary' | 'photos' | 'attendees' | 'finalize';
+type TabKey = 'basic' | 'recording' | 'manual' | 'transcript' | 'summary' | 'photos' | 'attendees' | 'finalize';
 
 /**
  * 회의 상세 뷰 메인 컴포넌트
@@ -54,6 +56,8 @@ export const MeetingDetailView: React.FC<MeetingDetailViewProps> = ({
   const [activeTab, setActiveTab] = useState<TabKey>('basic');
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [showSavedToast, setShowSavedToast] = useState<boolean>(false);
+  const [isLiveRecording, setIsLiveRecording] = useState<boolean>(false);
+  const [liveRecordDuration, setLiveRecordDuration] = useState<number>(0);
 
   const isFinalized = meeting.status === 'finalized';
   const isReadOnly = isFinalized;
@@ -193,6 +197,33 @@ export const MeetingDetailView: React.FC<MeetingDetailViewProps> = ({
         >
           <Mic className="w-3.5 h-3.5" />
           <span>녹음 및 오디오</span>
+          {isLiveRecording && (
+            <span className="w-2 h-2 rounded-full bg-red-500 animate-ping ml-0.5" />
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('manual')}
+          className={`flex items-center space-x-1.5 px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
+            activeTab === 'manual'
+              ? 'bg-blue-600 text-white shadow-sm'
+              : 'text-slate-600 hover:bg-slate-100'
+          }`}
+        >
+          <Keyboard className="w-3.5 h-3.5" />
+          <span>직접 작성</span>
+          {meeting.manualEntries && meeting.manualEntries.length > 0 && (
+            <span
+              className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                activeTab === 'manual'
+                  ? 'bg-blue-700 text-white'
+                  : 'bg-blue-100 text-blue-800'
+              }`}
+            >
+              {meeting.manualEntries.length}
+            </span>
+          )}
         </button>
 
         <button
@@ -305,14 +336,32 @@ export const MeetingDetailView: React.FC<MeetingDetailViewProps> = ({
           />
         )}
 
-        {activeTab === 'recording' && (
+        {/* 녹음 탭: 탭 이동 시에도 MediaRecorder가 언마운트되지 않도록 hidden 방식으로 보존 */}
+        <div className={activeTab === 'recording' ? 'block' : 'hidden'}>
           <RecordingTab
             meeting={meeting}
             isReadOnly={isReadOnly}
             onUpdateMeeting={handlePartialUpdate}
             onSwitchToTranscriptTab={() => setActiveTab('transcript')}
+            onRecordingStateChange={(rec, dur) => {
+              setIsLiveRecording(rec);
+              setLiveRecordDuration(dur);
+            }}
           />
-        )}
+        </div>
+
+        {/* 직접 작성 탭: 입력 중 텍스트 보존을 위해 hidden 방식으로 보존 */}
+        <div className={activeTab === 'manual' ? 'block' : 'hidden'}>
+          <ManualEntryTab
+            meeting={meeting}
+            isReadOnly={isReadOnly}
+            onUpdateMeeting={handlePartialUpdate}
+            onSave={handleSave}
+            isRecording={isLiveRecording}
+            currentRecordDurationSeconds={liveRecordDuration}
+            onNavigateTab={(tabKey) => setActiveTab(tabKey as TabKey)}
+          />
+        </div>
 
         {activeTab === 'transcript' && (
           <TranscriptTab

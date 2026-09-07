@@ -56,6 +56,21 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
   const signedAttendees = meeting.attendees.filter((a) => a.signatures && a.signatures.length > 0);
   const unsignedAttendees = meeting.attendees.filter((a) => !a.signatures || a.signatures.length === 0);
 
+  // 내용 작성 여부 (본문 행 또는 직접 작성 발언/자유 메모)
+  const hasMeetingContent = Boolean(
+    (meeting.contentRows && meeting.contentRows.length > 0) ||
+    (meeting.manualEntries && meeting.manualEntries.length > 0) ||
+    (meeting.freeformMemo && meeting.freeformMemo.trim().length > 0)
+  );
+
+  const contentCountDesc = meeting.contentRows && meeting.contentRows.length > 0
+    ? `본문 표: ${meeting.contentRows.length}건`
+    : meeting.manualEntries && meeting.manualEntries.length > 0
+    ? `직접 작성 발언: ${meeting.manualEntries.length}건`
+    : meeting.freeformMemo && meeting.freeformMemo.trim().length > 0
+    ? '자유 메모 작성 완료'
+    : '회의 내용 미작성';
+
   // 누락 검증 체크리스트 항목들
   const checklist = [
     {
@@ -64,9 +79,9 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
       detail: meeting.title ? `${meeting.title} (${meeting.date})` : '제목 또는 일자 누락',
     },
     {
-      label: '회의 내용(구분/내용) 1건 이상 작성',
-      pass: Boolean(meeting.contentRows && meeting.contentRows.length > 0),
-      detail: `작성된 항목: ${meeting.contentRows?.length || 0}건`,
+      label: '회의 내용(구분/내용 또는 직접 작성) 1건 이상 작성',
+      pass: hasMeetingContent,
+      detail: contentCountDesc,
     },
     {
       label: '참석자 명단 등록 (최소 1인 이상)',
@@ -378,7 +393,7 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
           </table>
         </div>
 
-        {/* 3. 회의 내용 및 심의 결과 표 (구분 / 내용 표) */}
+        {/* 3. 회의 내용 및 심의 결과 표 (구분 / 내용 표 또는 직접 작성 회의록) */}
         <div className="mb-6">
           <h2 className="text-sm font-bold text-slate-900 mb-2">
             ■ 회의 내용 및 심의·의결 결과
@@ -391,7 +406,7 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
               </tr>
             </thead>
             <tbody>
-              {(meeting.contentRows && meeting.contentRows.length > 0) ? (
+              {meeting.contentRows && meeting.contentRows.length > 0 ? (
                 meeting.contentRows.map((row) => (
                   <tr key={row.id}>
                     <td className="border border-slate-900 p-2.5 font-bold text-slate-800 align-top text-center">
@@ -399,6 +414,17 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
                     </td>
                     <td className="border border-slate-900 p-2.5 whitespace-pre-wrap leading-relaxed">
                       {row.content}
+                    </td>
+                  </tr>
+                ))
+              ) : meeting.manualEntries && meeting.manualEntries.length > 0 ? (
+                meeting.manualEntries.map((entry, idx) => (
+                  <tr key={entry.id}>
+                    <td className="border border-slate-900 p-2.5 font-bold text-slate-800 align-top text-center">
+                      {entry.speakerName}
+                    </td>
+                    <td className="border border-slate-900 p-2.5 whitespace-pre-wrap leading-relaxed">
+                      {entry.text}
                     </td>
                   </tr>
                 ))
@@ -411,10 +437,21 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
               )}
             </tbody>
           </table>
+
+          {/* 직접 작성 자유 메모가 있는 경우 함께 출력 */}
+          {meeting.freeformMemo && meeting.freeformMemo.trim().length > 0 && (
+            <div className="mt-3 border border-slate-900 p-3 text-xs">
+              <h3 className="font-bold text-slate-800 mb-1.5">[회의 메모 및 비고]</h3>
+              <p className="whitespace-pre-wrap leading-relaxed text-slate-900">
+                {meeting.freeformMemo}
+              </p>
+            </div>
+          )}
         </div>
 
-        {/* 4. 확정 결정 사항 및 후속 조치 요약 표 */}
-        {meeting.summary && (
+        {/* 4. 확정 결정 사항 및 후속 조치 요약 표 (AI Action Items + 직접 작성 Action Items 결합) */}
+        {((meeting.summary && meeting.summary.actionItems && meeting.summary.actionItems.length > 0) ||
+          (meeting.manualActionItems && meeting.manualActionItems.length > 0)) && (
           <div className="avoid-break mb-6">
             <h2 className="text-sm font-bold text-slate-900 mb-2">
               ■ 후속 조치 과제 (Action Items)
@@ -429,7 +466,25 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
                 </tr>
               </thead>
               <tbody>
-                {(meeting.summary.actionItems || []).map((act) => (
+                {/* 수동 등록 후속 과제 */}
+                {(meeting.manualActionItems || []).map((mAct) => (
+                  <tr key={mAct.id} className="bg-purple-50/20">
+                    <td className="border border-slate-900 p-2">
+                      <span className="font-semibold text-slate-900">{mAct.task}</span>
+                    </td>
+                    <td className="border border-slate-900 p-2 text-center">{mAct.assignee || '-'}</td>
+                    <td className="border border-slate-900 p-2 text-center">{mAct.dueDate || '-'}</td>
+                    <td className="border border-slate-900 p-2 text-center font-semibold">
+                      {mAct.status === 'completed'
+                        ? '완료'
+                        : mAct.status === 'in_progress'
+                        ? '진행중'
+                        : '대기'}
+                    </td>
+                  </tr>
+                ))}
+                {/* AI 도출 후속 과제 */}
+                {(meeting.summary?.actionItems || []).map((act) => (
                   <tr key={act.id}>
                     <td className="border border-slate-900 p-2">{act.task}</td>
                     <td className="border border-slate-900 p-2 text-center">{act.assignee || '-'}</td>

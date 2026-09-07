@@ -5,9 +5,9 @@
  */
 
 import React, { useState } from 'react';
-import { X, Database, ShieldAlert, CheckCircle, ExternalLink, RefreshCw, Save, Activity, Loader2 } from 'lucide-react';
+import { X, Database, ShieldAlert, CheckCircle, ExternalLink, RefreshCw, Save, Activity, Loader2, AlertTriangle } from 'lucide-react';
 import { FirebaseConnectionStatus } from '../../types/auth';
-import { getFirebaseConfig, STORAGE_KEYS, FirebaseClientConfig } from '../../config/appConfig';
+import { getFirebaseConfigWithSource, STORAGE_KEYS, FirebaseClientConfig } from '../../config/appConfig';
 import { testFirestoreConnection } from '../../services/firebase';
 import { logger } from '../../utils/logger';
 
@@ -29,7 +29,8 @@ export const FirebaseConfigModal: React.FC<FirebaseConfigModalProps> = ({
 }) => {
   logger.debug('FirebaseConfigModal rendered', { isOpen, isConfigured: status.isConfigured });
 
-  const existingConfig = getFirebaseConfig() || {
+  const { config: existingConfigData, source: configSource } = getFirebaseConfigWithSource();
+  const existingConfig = existingConfigData || {
     apiKey: '',
     authDomain: '',
     projectId: '',
@@ -184,6 +185,56 @@ export const FirebaseConfigModal: React.FC<FirebaseConfigModalProps> = ({
           {/* 상태 진단 탭 */}
           {activeTab === 'status' && (
             <div className="space-y-4">
+              {/* 설정 출처(Source) 진단 배너 */}
+              {configSource === 'localStorage' && (
+                <div className="p-3.5 bg-amber-50 border border-amber-300 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-900">
+                  <div className="space-y-1">
+                    <div className="font-bold flex items-center space-x-1.5">
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>설정 출처: 브라우저 로컬 저장소 (localStorage override)</span>
+                    </div>
+                    <p className="text-[11px] text-amber-800 leading-relaxed">
+                      이전에 브라우저에 직접 입력된 Firebase 설정이 우선 적용 중입니다. 만약 Storage 버킷이나 프로젝트가 일치하지 않아 HTTP 403 오류가 발생할 경우 설정을 초기화해주세요.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleClear}
+                    className="shrink-0 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded font-bold text-xs transition-colors self-start sm:self-center"
+                  >
+                    기본 설정으로 초기화
+                  </button>
+                </div>
+              )}
+
+              {/* 프로젝트 일치 여부 진단 패널 (projectId, authDomain, storageBucket) */}
+              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2 text-xs">
+                <span className="font-bold text-slate-800 block">Firebase 프로젝트 파라미터 일치 진단</span>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px] font-mono">
+                  <div className="p-2 bg-white rounded border border-slate-200">
+                    <span className="text-slate-400 block text-[10px] font-sans">Project ID</span>
+                    <span className="font-semibold text-slate-800 truncate block">
+                      {existingConfig.projectId || '(미설정)'}
+                    </span>
+                  </div>
+                  <div className="p-2 bg-white rounded border border-slate-200">
+                    <span className="text-slate-400 block text-[10px] font-sans">Auth Domain</span>
+                    <span className="font-semibold text-slate-800 truncate block">
+                      {existingConfig.authDomain || '(미설정)'}
+                    </span>
+                  </div>
+                  <div className="p-2 bg-white rounded border border-slate-200">
+                    <span className="text-slate-400 block text-[10px] font-sans">Storage Bucket</span>
+                    <span className="font-semibold text-slate-800 truncate block">
+                      {existingConfig.storageBucket || '(미설정)'}
+                    </span>
+                  </div>
+                </div>
+                <p className="text-[10px] text-slate-500">
+                  * Auth와 Storage는 동일한 Firebase Project ID를 참조해야 403 권한 거부가 발생하지 않습니다.
+                </p>
+              </div>
+
               <div
                 className={`p-4 rounded-lg border ${
                   status.isConfigured

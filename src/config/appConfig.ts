@@ -59,24 +59,48 @@ function normalizeStorageBucket(rawBucket: string | undefined, projectId: string
   return cleaned;
 }
 
-/**
- * 환경 변수 또는 로컬 오버라이드에서 Firebase 설정을 로드하는 함수
- * @returns {FirebaseClientConfig | null} Firebase 설정 객체 또는 미설정 시 null
- */
-export function getFirebaseConfig(): FirebaseClientConfig | null {
-  logger.info('getFirebaseConfig called');
+export type FirebaseConfigSource = 'localStorage' | 'environment' | 'default' | 'none';
 
+/**
+ * Firebase 설정과 출처(source) 정보를 함께 반환하는 인터페이스
+ */
+export interface FirebaseConfigWithSource {
+  config: FirebaseClientConfig | null;
+  source: FirebaseConfigSource;
+}
+
+/**
+ * 환경 변수 또는 로컬 오버라이드에서 Firebase 설정을 출처 정보와 함께 로드하는 함수
+ * @returns {FirebaseConfigWithSource}
+ */
+export function getFirebaseConfigWithSource(): FirebaseConfigWithSource {
   // 1. 브라우저 localStorage 사용자 직접 입력 오버라이드 확인
   try {
     const override = localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG_OVERRIDE);
     if (override) {
       const parsed = JSON.parse(override) as FirebaseClientConfig;
       if (parsed.apiKey && parsed.projectId) {
-        logger.info('Firebase config loaded from localStorage override');
-        return {
+        const normalizedBucket = normalizeStorageBucket(parsed.storageBucket, parsed.projectId);
+        const resolvedConfig: FirebaseClientConfig = {
           ...parsed,
-          storageBucket: normalizeStorageBucket(parsed.storageBucket, parsed.projectId),
+          storageBucket: normalizedBucket,
+          authDomain: parsed.authDomain || `${parsed.projectId}.firebaseapp.com`,
         };
+
+        // 진단 로그: API 키 전체 값은 출력하지 않고 projectId, authDomain, storageBucket, source만 안전하게 로깅
+        console.log('[firebase-diagnostics]', {
+          projectId: resolvedConfig.projectId,
+          authDomain: resolvedConfig.authDomain,
+          storageBucket: resolvedConfig.storageBucket,
+          source: 'localStorage',
+        });
+
+        logger.info('Firebase config loaded from localStorage override', {
+          projectId: resolvedConfig.projectId,
+          storageBucket: resolvedConfig.storageBucket,
+        });
+
+        return { config: resolvedConfig, source: 'localStorage' };
       }
     }
   } catch (e) {
@@ -94,20 +118,49 @@ export function getFirebaseConfig(): FirebaseClientConfig | null {
   const measurementId = env.VITE_FIREBASE_MEASUREMENT_ID || '';
 
   if (apiKey && projectId) {
-    logger.info('Firebase config loaded from import.meta.env');
-    return {
+    const normalizedBucket = normalizeStorageBucket(storageBucket, projectId);
+    const resolvedConfig: FirebaseClientConfig = {
       apiKey,
       authDomain: authDomain || `${projectId}.firebaseapp.com`,
       projectId,
-      storageBucket: normalizeStorageBucket(storageBucket, projectId),
+      storageBucket: normalizedBucket,
       messagingSenderId,
       appId,
       measurementId,
     };
+
+    console.log('[firebase-diagnostics]', {
+      projectId: resolvedConfig.projectId,
+      authDomain: resolvedConfig.authDomain,
+      storageBucket: resolvedConfig.storageBucket,
+      source: 'environment',
+    });
+
+    logger.info('Firebase config loaded from import.meta.env', {
+      projectId: resolvedConfig.projectId,
+      storageBucket: resolvedConfig.storageBucket,
+    });
+
+    return { config: resolvedConfig, source: 'environment' };
   }
 
+  console.log('[firebase-diagnostics]', {
+    projectId: null,
+    authDomain: null,
+    storageBucket: null,
+    source: 'none',
+  });
+
   logger.info('No active Firebase config detected (Fallback mode available)');
-  return null;
+  return { config: null, source: 'none' };
+}
+
+/**
+ * 환경 변수 또는 로컬 오버라이드에서 Firebase 설정을 로드하는 함수
+ * @returns {FirebaseClientConfig | null} Firebase 설정 객체 또는 미설정 시 null
+ */
+export function getFirebaseConfig(): FirebaseClientConfig | null {
+  return getFirebaseConfigWithSource().config;
 }
 
 /**

@@ -20,8 +20,10 @@ import {
   Clock,
   Sparkles,
   RotateCcw,
+  Keyboard,
+  Mic,
 } from 'lucide-react';
-import { Meeting, TranscriptSegment, Attendee } from '../../../types/meeting';
+import { Meeting, TranscriptSegment, Attendee, ManualEntry } from '../../../types/meeting';
 import { formatDuration } from '../../../utils/formatters';
 import { logger } from '../../../utils/logger';
 
@@ -107,24 +109,45 @@ export const TranscriptTab: React.FC<TranscriptTabProps> = ({
     setEditingText(segment.text);
   };
 
-  /**
-   * 발언 수정 저장
-   */
-  const handleSaveEditing = (segmentId: string) => {
-    logger.info('Saving edited segment text', { segmentId });
-    const updatedTranscripts = (meeting.transcripts || []).map((seg) => {
-      if (seg.id === segmentId) {
-        return {
-          ...seg,
-          text: editingText,
-          originalAiText: seg.originalAiText || seg.text,
-          isUserEdited: true,
-        };
-      }
-      return seg;
-    });
+  // 출처 필터 상태 (전체 | AI 전사 | 직접 작성)
+  const [sourceFilter, setSourceFilter] = useState<'all' | 'ai' | 'manual'>('all');
 
-    onUpdateMeeting({ transcripts: updatedTranscripts });
+  /**
+   * 발언 수정 저장 (AI 전사 또는 직접 작성 발언)
+   */
+  const handleSaveEditing = (itemId: string) => {
+    logger.info('Saving edited segment or entry text', { itemId });
+
+    // 1. AI 대화록 세그먼트인지 확인
+    const isAiSegment = (meeting.transcripts || []).some((s) => s.id === itemId);
+    if (isAiSegment) {
+      const updatedTranscripts = (meeting.transcripts || []).map((seg) => {
+        if (seg.id === itemId) {
+          return {
+            ...seg,
+            text: editingText,
+            originalAiText: seg.originalAiText || seg.text,
+            isUserEdited: true,
+          };
+        }
+        return seg;
+      });
+      onUpdateMeeting({ transcripts: updatedTranscripts });
+    } else {
+      // 2. 직접 작성 발언 항목인 경우
+      const updatedEntries = (meeting.manualEntries || []).map((entry) => {
+        if (entry.id === itemId) {
+          return {
+            ...entry,
+            content: editingText,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        return entry;
+      });
+      onUpdateMeeting({ manualEntries: updatedEntries });
+    }
+
     setEditingSegmentId(null);
   };
 
@@ -191,44 +214,118 @@ export const TranscriptTab: React.FC<TranscriptTabProps> = ({
   };
 
   /**
-   * 대화록 TXT 파일 다운로드
+   * 통합 대화록(AI 전사 + 직접 작성 발언) 목록 생성 (timestamp 기준 정렬)
+   */
+  const unifiedItems = useMemo(() => {
+    const items: Array<{
+      id: string;
+      kind: 'ai' | 'manual';
+      speakerId: string;
+      speakerName: string;
+      startSeconds: number;
+      endSeconds: number;
+      text: string;
+      originalAiText?: string;
+      isUserEdited?: boolean;
+      needsReview?: boolean;
+      createdAt?: string;
+    }> = [];
+
+    // AI 전사 세그먼트 추가
+    (meeting.transcripts || []).forEach((seg) => {
+      items.push({
+        id: seg.id,
+        kind: 'ai',
+        speakerId: seg.speakerId,
+        speakerName: getSpeakerDisplayName(seg.speakerId),
+        startSeconds: seg.startSeconds || 0,
+        endSeconds: seg.endSeconds || (seg.startSeconds || 0) + 5,
+        text: seg.text,
+        originalAiText: seg.originalAiText,
+        isUserEdited: seg.isUserEdited,
+        needsReview: seg.needsReview,
+      });
+    });
+
+    // 직접 작성 발언 항목 추가
+    (meeting.manualEntries || []).forEach((entry) => {
+      items.push({
+        id: entry.id,
+        kind: 'manual',
+        speakerId: `manual_${entry.speakerName}`,
+        speakerName: entry.speakerName,
+        startSeconds: entry.timestampSeconds || 0,
+        endSeconds: (entry.timestampSeconds || 0) + 10,
+        text: entry.content,
+        originalAiText: undefined,
+        isUserEdited: false,
+        needsReview: false,
+        createdAt: entry.createdAt,
+      });
+    });
+
+    // 시간순 정렬 (startSeconds 오름차순, 동일시 등록순)
+    return items.sort((a, b) => {
+      if (a.startSeconds !== b.startSeconds) {
+        return a.startSeconds - b.startSeconds;
+      }
+      return (a.createdAt || '').localeCompare(b.createdAt || '');
+    });
+  }, [meeting.transcripts, meeting.manualEntries, meeting.speakerMapping]);
+
+  /**
+   * 대화록 TXT 파일 다운로드 (AI 전사 + 직접 작성 모두 포함)
    */
   const handleDownloadTxt = () => {
     logger.info('handleDownloadTxt called');
-    const lines = (meeting.transcripts || []).map((seg) => {
-      const speaker = getSpeakerDisplayName(seg.speakerId);
-      const time = `[${formatDuration(seg.startSeconds)} ~ ${formatDuration(seg.endSeconds)}]`;
-      return `${time} ${speaker}: ${seg.text}`;
+    const lines = unifiedItems.map((item) => {
+      const tag = item.kind === 'manual' ? '[직접작성]' : '[AI전사]';
+      const time = `[${formatDuration(item.startSeconds)} ~ ${formatDuration(item.endSeconds)}]`;
+      return `${time} ${tag} ${item.speakerName}: ${item.text}`;
     });
 
-    const content = `[${meeting.title}] 대화록 전문\n일시: ${meeting.date} (${meeting.startTime}~${meeting.endTime})\n장소: ${meeting.location}\n\n` + lines.join('\n\n');
+    const content =
+      `[${meeting.title}] 대화록 전문 (AI 전사 및 직접 작성 통합)\n` +
+      `일시: ${meeting.date} (${meeting.startTime}~${meeting.endTime})\n` +
+      `장소: ${meeting.location || '미정'}\n\n` +
+      lines.join('\n\n');
+
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `${meeting.title}_대화록.txt`;
+    link.download = `${meeting.title}_통합대화록.txt`;
     link.click();
     URL.revokeObjectURL(url);
   };
 
-  // 필터링 적용
-  const filteredTranscripts = useMemo(() => {
-    return (meeting.transcripts || []).filter((seg) => {
-      if (speakerFilter !== 'all' && seg.speakerId !== speakerFilter) {
+  // 필터링 적용 (출처, 화자, 확인필요, 검색어)
+  const filteredItems = useMemo(() => {
+    return unifiedItems.filter((item) => {
+      // 1. 출처 필터 (전체, AI 전사, 직접 작성)
+      if (sourceFilter === 'ai' && item.kind !== 'ai') return false;
+      if (sourceFilter === 'manual' && item.kind !== 'manual') return false;
+
+      // 2. 화자 필터
+      if (speakerFilter !== 'all' && item.speakerId !== speakerFilter) {
         return false;
       }
-      if (onlyNeedsReview && !seg.needsReview) {
+
+      // 3. 확인 필요 필터 (AI 전사에만 적용)
+      if (onlyNeedsReview && !item.needsReview) {
         return false;
       }
+
+      // 4. 검색어 필터
       if (searchTerm.trim()) {
         const q = searchTerm.toLowerCase();
-        const inText = seg.text.toLowerCase().includes(q);
-        const inSpeaker = getSpeakerDisplayName(seg.speakerId).toLowerCase().includes(q);
+        const inText = item.text.toLowerCase().includes(q);
+        const inSpeaker = item.speakerName.toLowerCase().includes(q);
         if (!inText && !inSpeaker) return false;
       }
       return true;
     });
-  }, [meeting.transcripts, speakerFilter, onlyNeedsReview, searchTerm, meeting.speakerMapping]);
+  }, [unifiedItems, sourceFilter, speakerFilter, onlyNeedsReview, searchTerm]);
 
   return (
     <div className="space-y-6">
@@ -293,6 +390,45 @@ export const TranscriptTab: React.FC<TranscriptTabProps> = ({
 
       {/* 검색 및 필터 툴바 */}
       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col md:flex-row items-center gap-3">
+        {/* 출처 탭 필터 (전체 / AI 전사 / 직접 작성) */}
+        <div className="flex items-center p-1 bg-slate-100 rounded-lg shrink-0 w-full md:w-auto">
+          <button
+            type="button"
+            onClick={() => setSourceFilter('all')}
+            className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors flex-1 md:flex-initial ${
+              sourceFilter === 'all'
+                ? 'bg-white text-slate-800 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            전체 ({unifiedItems.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setSourceFilter('ai')}
+            className={`flex items-center justify-center space-x-1 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors flex-1 md:flex-initial ${
+              sourceFilter === 'ai'
+                ? 'bg-white text-blue-700 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Mic className="w-3 h-3" />
+            <span>AI 전사 ({(meeting.transcripts || []).length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setSourceFilter('manual')}
+            className={`flex items-center justify-center space-x-1 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors flex-1 md:flex-initial ${
+              sourceFilter === 'manual'
+                ? 'bg-white text-purple-700 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Keyboard className="w-3 h-3" />
+            <span>직접 작성 ({(meeting.manualEntries || []).length})</span>
+          </button>
+        </div>
+
         <div className="relative flex-1 w-full">
           <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
@@ -347,53 +483,77 @@ export const TranscriptTab: React.FC<TranscriptTabProps> = ({
       </div>
 
       {/* 발언 타임라인 목록 */}
-      {filteredTranscripts.length === 0 ? (
+      {filteredItems.length === 0 ? (
         <div className="bg-white rounded-xl border border-slate-200 p-12 text-center text-slate-500 text-xs">
-          대화록 데이터가 없습니다. [녹음 및 오디오] 탭에서 녹음 후 AI 전사를 실행해주세요.
+          대화록 데이터가 없습니다. [녹음 및 오디오] 탭에서 녹음 후 AI 전사를 실행하거나 [직접 작성] 탭에서 키보드로 회의내용을 입력해주세요.
         </div>
       ) : (
         <div className="space-y-3">
-          {filteredTranscripts.map((segment) => {
-            const isEditing = editingSegmentId === segment.id;
-            const speakerName = getSpeakerDisplayName(segment.speakerId);
+          {filteredItems.map((item) => {
+            const isEditing = editingSegmentId === item.id;
+            const isManual = item.kind === 'manual';
 
             return (
               <div
-                key={segment.id}
-                id={`transcript-segment-${segment.id}`}
+                key={item.id}
+                id={`transcript-segment-${item.id}`}
                 className={`bg-white rounded-xl border p-4 shadow-sm transition-all ${
-                  segment.needsReview ? 'border-amber-300 bg-amber-50/20' : 'border-slate-200'
+                  item.needsReview
+                    ? 'border-amber-300 bg-amber-50/20'
+                    : isManual
+                    ? 'border-purple-200 bg-purple-50/15'
+                    : 'border-slate-200'
                 }`}
               >
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
                   {/* 화자 및 타임스탬프 */}
-                  <div className="flex items-center space-x-2.5">
-                    <span className="px-2.5 py-0.5 rounded-full bg-blue-100 text-blue-800 text-xs font-bold">
-                      {speakerName}
+                  <div className="flex items-center space-x-2.5 flex-wrap gap-y-1">
+                    {/* 출처 배지 */}
+                    {isManual ? (
+                      <span className="px-2 py-0.5 rounded-md bg-purple-100 text-purple-800 text-[10px] font-bold flex items-center space-x-1">
+                        <Keyboard className="w-3 h-3" />
+                        <span>직접 작성</span>
+                      </span>
+                    ) : (
+                      <span className="px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 text-[10px] font-bold flex items-center space-x-1">
+                        <Mic className="w-3 h-3" />
+                        <span>AI 전사</span>
+                      </span>
+                    )}
+
+                    <span className="px-2.5 py-0.5 rounded-full bg-slate-100 text-slate-800 text-xs font-bold">
+                      {item.speakerName}
                     </span>
 
-                    {/* 오디오 타임스탬프 클릭 시 해당 시점으로 이동 */}
-                    <button
-                      type="button"
-                      onClick={() => onJumpAudioTime && onJumpAudioTime(segment.startSeconds)}
-                      className="flex items-center space-x-1 text-slate-500 hover:text-blue-600 text-xs font-mono transition-colors"
-                      title="해당 발언 시점부터 오디오 재생"
-                    >
-                      <Play className="w-3 h-3" />
-                      <span>{formatDuration(segment.startSeconds)}</span>
-                      <span>~</span>
-                      <span>{formatDuration(segment.endSeconds)}</span>
-                    </button>
+                    {/* 오디오 타임스탬프 */}
+                    {!isManual && onJumpAudioTime ? (
+                      <button
+                        type="button"
+                        onClick={() => onJumpAudioTime(item.startSeconds)}
+                        className="flex items-center space-x-1 text-slate-500 hover:text-blue-600 text-xs font-mono transition-colors"
+                        title="해당 발언 시점부터 오디오 재생"
+                      >
+                        <Play className="w-3 h-3" />
+                        <span>{formatDuration(item.startSeconds)}</span>
+                        <span>~</span>
+                        <span>{formatDuration(item.endSeconds)}</span>
+                      </button>
+                    ) : (
+                      <span className="flex items-center space-x-1 text-slate-400 text-xs font-mono">
+                        <Clock className="w-3 h-3" />
+                        <span>{formatDuration(item.startSeconds)}</span>
+                      </span>
+                    )}
 
                     {/* 사용자 수정 여부 표시 */}
-                    {segment.isUserEdited && (
+                    {item.isUserEdited && (
                       <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 font-medium">
                         수정됨
                       </span>
                     )}
 
                     {/* 확인 필요 배지 */}
-                    {segment.needsReview && (
+                    {item.needsReview && (
                       <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 font-bold flex items-center space-x-1">
                         <AlertTriangle className="w-3 h-3 text-amber-600" />
                         <span>확인 필요</span>
@@ -404,24 +564,29 @@ export const TranscriptTab: React.FC<TranscriptTabProps> = ({
                   {/* 컨트롤 버튼 군 */}
                   {!isReadOnly && (
                     <div className="flex items-center space-x-1 text-xs">
-                      {/* 확인 필요 토글 버튼 */}
-                      <button
-                        type="button"
-                        onClick={() => handleToggleNeedsReview(segment.id)}
-                        className={`px-2 py-1 rounded transition-colors text-[11px] ${
-                          segment.needsReview
-                            ? 'bg-amber-100 text-amber-800 hover:bg-amber-200'
-                            : 'text-slate-400 hover:text-amber-600 hover:bg-slate-100'
-                        }`}
-                      >
-                        {segment.needsReview ? '확인 해제' : '확인 필요 표시'}
-                      </button>
+                      {/* 확인 필요 토글 버튼 (AI 전사 항목만) */}
+                      {!isManual && (
+                        <button
+                          type="button"
+                          onClick={() => handleToggleNeedsReview(item.id)}
+                          className={`px-2 py-1 rounded transition-colors text-[11px] ${
+                            item.needsReview
+                              ? 'bg-amber-100 text-amber-800 hover:bg-amber-200'
+                              : 'text-slate-400 hover:text-amber-600 hover:bg-slate-100'
+                          }`}
+                        >
+                          {item.needsReview ? '확인 해제' : '확인 필요 표시'}
+                        </button>
+                      )}
 
                       {/* 수정 버튼 */}
                       {!isEditing && (
                         <button
                           type="button"
-                          onClick={() => handleStartEditing(segment)}
+                          onClick={() => {
+                            setEditingSegmentId(item.id);
+                            setEditingText(item.text);
+                          }}
                           className="p-1 text-slate-500 hover:text-blue-600 rounded hover:bg-slate-100"
                           title="발언 텍스트 수정"
                         >
@@ -442,10 +607,10 @@ export const TranscriptTab: React.FC<TranscriptTabProps> = ({
                       className="w-full text-xs p-2.5 bg-slate-50 border border-blue-400 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-500"
                     />
                     <div className="flex items-center justify-between text-xs">
-                      {segment.originalAiText && (
+                      {item.originalAiText && (
                         <button
                           type="button"
-                          onClick={() => handleRevertEditing(segment.id)}
+                          onClick={() => handleRevertEditing(item.id)}
                           className="flex items-center space-x-1 text-slate-500 hover:text-slate-700"
                         >
                           <RotateCcw className="w-3 h-3" />
@@ -462,7 +627,7 @@ export const TranscriptTab: React.FC<TranscriptTabProps> = ({
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleSaveEditing(segment.id)}
+                          onClick={() => handleSaveEditing(item.id)}
                           className="flex items-center space-x-1 px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded shadow-sm"
                         >
                           <Check className="w-3 h-3" />
@@ -473,7 +638,7 @@ export const TranscriptTab: React.FC<TranscriptTabProps> = ({
                   </div>
                 ) : (
                   <p className="text-xs text-slate-800 leading-relaxed whitespace-pre-wrap">
-                    {segment.text}
+                    {item.text}
                   </p>
                 )}
               </div>

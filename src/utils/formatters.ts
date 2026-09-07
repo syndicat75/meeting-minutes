@@ -25,6 +25,8 @@ export function formatDuration(seconds: number): string {
   return `${pad(minutes)}:${pad(remainingSeconds)}`;
 }
 
+export const formatSecondsToTime = formatDuration;
+
 /**
  * 바이트 크기를 사람이 읽기 쉬운 단위(KB, MB, GB)로 변환
  * @param bytes 바이트 수

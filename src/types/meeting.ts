@@ -83,6 +83,46 @@ export interface TranscriptSegment {
   isUserEdited?: boolean; // 사용자 수정 여부
   needsReview: boolean; // 동시 발화, 불명확 구간, 들리지 않는 말 등
   confidence?: number;
+  source?: 'manual' | 'ai_transcription' | 'openai' | 'gemini' | 'imported';
+}
+
+/**
+ * 발언 및 데이터 출처 구분
+ */
+export type EntrySource = 'manual' | 'ai_transcription' | 'openai' | 'gemini' | 'imported';
+
+/**
+ * 사람이 직접 키보드로 입력한 회의 발언 데이터 모델
+ */
+export interface ManualEntry {
+  id: string;
+  speakerId?: string; // 참석자 ID (선택) 또는 'unassigned' | 'other'
+  speakerName: string; // "김부장", "이과장", "참석자 미지정", "기타" 등
+  timestampSeconds?: number; // 회의 녹음 타임스탬프 (초) - 선택사항
+  text: string;
+  source: EntrySource;
+  isOfficial: boolean; // true: 공식 회의록 포함, false: 개인 메모 (최종 인쇄 제외)
+  isImportant?: boolean; // ⭐ 중요 표시 여부 (최종 요약 시 우선순위)
+  order: number; // 수동 발언 순서 (드래그앤드롭 및 위/아래 이동용)
+  createdAt: string; // ISO String
+  updatedAt: string; // ISO String
+  createdBy?: string;
+  updatedBy?: string;
+}
+
+/**
+ * 사람이 직접 등록한 Action Item 데이터 모델
+ */
+export interface ManualActionItem {
+  id: string;
+  task: string; // 구체적 실행 업무
+  assignee: string; // 담당자 (참석자 이름 또는 '미지정')
+  dueDate: string; // 완료 기한 (YYYY-MM-DD 또는 '미지정')
+  status: 'pending' | 'in_progress' | 'completed';
+  source: 'manual' | 'ai';
+  isImportant?: boolean;
+  createdAt: string;
+  updatedAt?: string;
 }
 
 /**
@@ -297,6 +337,9 @@ export interface MeetingVersionSnapshot {
   photos: MeetingPhoto[];
   summary?: MeetingSummary;
   notes?: string;
+  manualEntries?: ManualEntry[];
+  freeformMemo?: string;
+  manualActionItems?: ManualActionItem[];
 }
 
 /**
@@ -325,6 +368,11 @@ export interface Meeting {
   
   // 참석자 목록
   attendees: Attendee[];
+
+  // 직접 작성 회의록 및 메모 (녹음 없이도 단독 사용 가능)
+  manualEntries?: ManualEntry[]; // 화자별 직접 입력 발언
+  freeformMemo?: string; // 회의 중 빠른 자유 메모
+  manualActionItems?: ManualActionItem[]; // 직접 등록한 후속 조치 과제
   
   // 녹음 및 대화록
   recording?: RecordingMetadata;
@@ -424,6 +472,9 @@ export function createDefaultMeeting(authorName: string = '관리자', ownerUid:
     },
     contentRows: defaultContentRows,
     attendees: defaultAttendees,
+    manualEntries: [],
+    freeformMemo: '',
+    manualActionItems: [],
     transcripts: [],
     speakerMapping: {},
     photos: [],

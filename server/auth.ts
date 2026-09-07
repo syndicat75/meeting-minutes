@@ -211,10 +211,12 @@ export async function verifyMeetingAccess(
  * @param {string} storagePath Firebase Storage 경로
  * @returns {boolean} 허용 여부
  */
-export function isValidMeetingStoragePath(meetingId: string, storagePath: string): boolean {
-  console.log('[AUTH] isValidMeetingStoragePath called', { meetingId, storagePath });
+export function isValidMeetingStoragePath(meetingId: string, rawStoragePath: string): boolean {
+  console.log('[AUTH] isValidMeetingStoragePath called', { meetingId, storagePath: rawStoragePath });
 
-  if (!meetingId || !storagePath) return false;
+  if (!meetingId || !rawStoragePath) return false;
+
+  const storagePath = rawStoragePath.replace(/^local\//, '');
 
   // 디렉터리 트래버설 차단
   if (storagePath.includes('..') || storagePath.startsWith('/')) {

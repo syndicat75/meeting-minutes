@@ -375,9 +375,19 @@ export class ChunkAudioRecorder {
     const lastChunkIdx = this.chunkIndex;
     const lastStartSec = this.chunkStartSeconds;
     const lastEndSec = this.durationSeconds;
+    const recordedTotalDuration = Math.max(this.durationSeconds, 1);
 
     // 마지막 청크 정지 및 콜백 호출
     if (this.currentRecorder && this.currentRecorder.state !== 'inactive') {
+      try {
+        // 마지막 버퍼에 남아있는 데이터 강제 플러시
+        if (typeof this.currentRecorder.requestData === 'function') {
+          this.currentRecorder.requestData();
+        }
+      } catch (e) {
+        logger.debug('requestData on final chunk ignored', e);
+      }
+
       await new Promise<void>((resolve) => {
         if (!this.currentRecorder) return resolve();
         this.currentRecorder.onstop = async () => {
@@ -409,7 +419,7 @@ export class ChunkAudioRecorder {
     this.cleanup();
 
     return {
-      totalDurationSeconds: this.durationSeconds,
+      totalDurationSeconds: recordedTotalDuration,
       totalChunks: lastChunkIdx,
     };
   }

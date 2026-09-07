@@ -104,21 +104,34 @@ export async function uploadRecordingAudio(
   onProgress?: UploadProgressCallback
 ): Promise<{ storagePath: string; downloadUrl: string }> {
   logger.info('uploadRecordingAudio called', { meetingId, size: audioBlob.size, mimeType });
+  const auth = getFirebaseAuth();
+  const currentUser = auth?.currentUser;
   const storage = getFirebaseStorageInstance();
 
-  if (!storage) {
-    logger.warn('Firebase storage is not configured, creating local object URL');
-    const localUrl = URL.createObjectURL(audioBlob);
-    if (onProgress) onProgress(100, audioBlob.size, audioBlob.size);
-    return {
-      storagePath: `local/meetings/${meetingId}/recordings/recording_${Date.now()}`,
-      downloadUrl: localUrl,
-    };
-  }
+  console.log('[storage-auth]', {
+    uid: currentUser?.uid ?? null,
+    hasUser: !!currentUser,
+  });
 
   const extension = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('wav') ? 'wav' : 'webm';
   const fileName = `audio_${Date.now()}.${extension}`;
   const storagePath = `meetings/${meetingId}/recordings/${fileName}`;
+
+  console.log('[storage-upload-path]', { storagePath });
+
+  if (!storage || !currentUser) {
+    logger.warn('Firebase storage is not configured or user not authenticated, creating local object URL', {
+      hasStorage: Boolean(storage),
+      hasUser: Boolean(currentUser),
+    });
+    const localUrl = URL.createObjectURL(audioBlob);
+    if (onProgress) onProgress(100, audioBlob.size, audioBlob.size);
+    return {
+      storagePath: `local/${storagePath}`,
+      downloadUrl: localUrl,
+    };
+  }
+
   const fileRef = ref(storage, storagePath);
 
   const metadata = {
@@ -126,6 +139,7 @@ export async function uploadRecordingAudio(
     customMetadata: {
       meetingId,
       uploadedAt: new Date().toISOString(),
+      uploadedByUid: currentUser.uid,
     },
   };
 
@@ -169,7 +183,7 @@ export async function uploadAudioChunkToStorage(
   chunkBlob: Blob,
   mimeType: string,
   onProgress?: UploadProgressCallback
-): Promise<{ storagePath: string; downloadUrl: string }> {
+): Promise<{ storagePath: string; downloadUrl: string; isLocalFallback?: boolean }> {
   logger.info('uploadAudioChunkToStorage called', { meetingId, chunkId, byteLength: chunkBlob?.size });
 
   // 1. meetingId 유효성 엄격 검증
@@ -201,23 +215,16 @@ export async function uploadAudioChunkToStorage(
     throw zeroSizeErr;
   }
 
-  // 3. Firebase 로그인 사용자 확인
+  // 3. Firebase Storage 및 인증 확인
   const auth = getFirebaseAuth();
   const currentUser = auth?.currentUser;
-  if (!currentUser) {
-    const noUserErr = new Error('로그인 상태를 확인해주세요. (인증된 사용자만 Storage에 업로드할 수 있습니다.)');
-    (noUserErr as any).code = 'storage/unauthorized-no-user';
-    console.error('[audio-chunk-upload]', {
-      code: 'storage/unauthorized-no-user',
-      message: noUserErr.message,
-      name: noUserErr.name,
-      meetingId,
-      chunkId,
-    });
-    throw noUserErr;
-  }
-
   const storage = getFirebaseStorageInstance();
+
+  // 진단 로그: auth.currentUser 상태 (ID 토큰 등 민감값 제외)
+  console.log('[storage-auth]', {
+    uid: currentUser?.uid ?? null,
+    hasUser: !!currentUser,
+  });
 
   // 4. 정렬 가능한 4자리 파일명 강제 (예: chunk_0001.webm)
   const chunkNumberMatch = chunkId.match(/\d+/);
@@ -228,18 +235,24 @@ export async function uploadAudioChunkToStorage(
   const fileName = `${normalizedChunkId}.${extension}`;
   const storagePath = `meetings/${meetingId}/audio/chunks/${fileName}`;
 
-  if (!storage) {
-    const noStorageErr = new Error('Firebase Storage가 활성화되지 않았거나 설정되지 않았습니다.');
-    (noStorageErr as any).code = 'storage/not-configured';
-    console.error('[audio-chunk-upload]', {
-      code: 'storage/not-configured',
-      message: noStorageErr.message,
-      name: noStorageErr.name,
-      meetingId,
-      chunkId,
-      storagePath,
+  // 진단 로그: 실제 Storage 업로드 경로 출력
+  console.log('[storage-upload-path]', { storagePath });
+
+  // auth.currentUser가 null이면 Firebase Storage 업로드를 시도하지 않음 (403 방지 및 로컬 안전 보존)
+  if (!currentUser || !storage) {
+    console.warn('[storage-auth] Upload aborted: auth.currentUser or storage instance is null', {
+      hasUser: Boolean(currentUser),
+      hasStorage: Boolean(storage),
     });
-    throw noStorageErr;
+    const localUrl = URL.createObjectURL(chunkBlob);
+    if (onProgress) {
+      onProgress(100, chunkBlob.size, chunkBlob.size);
+    }
+    return {
+      storagePath: `local/${storagePath}`,
+      downloadUrl: localUrl,
+      isLocalFallback: true,
+    };
   }
 
   const fileRef = ref(storage, storagePath);
@@ -259,7 +272,24 @@ export async function uploadAudioChunkToStorage(
     },
   };
 
-  // 지수 백오프 재시도 (최대 3회: 2초, 5초, 10초)
+  // 재시도 대상 에러 판별 헬퍼
+  // 403, storage/unauthorized, storage/unauthenticated, storage/no-default-bucket은 시간 경과로 해결되지 않으므로 즉시 실패
+  const isNonRetryableError = (error: any): boolean => {
+    const code = String(error?.code || '');
+    const message = String(error?.message || '');
+    const serverResponse = String(error?.serverResponse || '');
+    return (
+      code === 'storage/unauthorized' ||
+      code === 'storage/unauthenticated' ||
+      code === 'storage/no-default-bucket' ||
+      code.includes('unauthorized') ||
+      code.includes('permission-denied') ||
+      message.includes('403') ||
+      serverResponse.includes('403')
+    );
+  };
+
+  // 지수 백오프 재시도 (최대 3회: 2초, 5초, 10초) - 403 등 권한 오류 시에는 즉시 중단
   const retryDelays = [2000, 5000, 10000];
 
   const attemptUpload = async (): Promise<{ storagePath: string; downloadUrl: string }> => {
@@ -275,8 +305,9 @@ export async function uploadAudioChunkToStorage(
           }
         },
         (error) => {
+          const is403 = isNonRetryableError(error);
           console.error('[audio-chunk-upload]', {
-            code: (error as any)?.code,
+            code: (error as any)?.code || (is403 ? 'storage/unauthorized' : 'storage/unknown'),
             message: (error as any)?.message,
             name: (error as any)?.name,
             meetingId,
@@ -284,6 +315,7 @@ export async function uploadAudioChunkToStorage(
             storagePath,
             blobSize: chunkBlob.size,
             mimeType: normalizedContentType,
+            isNonRetryable: is403,
           });
           reject(error);
         },
@@ -317,9 +349,25 @@ export async function uploadAudioChunkToStorage(
         await new Promise((r) => setTimeout(r, delay));
       }
       return await attemptUpload();
-    } catch (err) {
+    } catch (err: any) {
       lastError = err;
       logger.error(`Chunk upload attempt ${attempt + 1} failed`, err);
+
+      // 403 / storage/unauthorized / storage/unauthenticated 발생 시 추가 재시도 즉시 중단
+      if (isNonRetryableError(err)) {
+        logger.warn('Non-retryable authorization error (HTTP 403) detected. Aborting automatic retry.', {
+          code: err?.code,
+          message: err?.message,
+        });
+        const friendlyError = new Error(
+          '녹음 저장 권한이 없습니다. Firebase Storage 권한 설정을 확인해주세요.'
+        );
+        (friendlyError as any).code = err?.code || 'storage/unauthorized';
+        (friendlyError as any).originalError = err;
+        (friendlyError as any).storagePath = storagePath;
+        (friendlyError as any).httpStatus = 403;
+        throw friendlyError;
+      }
     }
   }
 
