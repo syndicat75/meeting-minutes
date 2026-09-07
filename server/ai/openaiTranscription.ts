@@ -29,6 +29,10 @@ export interface LegacyTranscriptSegment {
   speakerName?: string;
   text: string;
   originalAiText?: string;
+  originalText?: string;
+  editedText?: string;
+  correctionStatus?: 'none' | 'pending' | 'approved' | 'rejected';
+  rawSpeakerLabel?: string;
   isUserEdited?: boolean;
   needsReview: boolean;
   confidence?: number;
@@ -114,13 +118,17 @@ function normalizeAudioFileInfo(mimeType: string): { extension: string; normaliz
  */
 function parseOpenAIDiarizationResponse(
   rawResponse: any,
-  attendeeNames: string[] = []
+  attendeeNames: string[] = [],
+  expectedSpeakerCount?: number
 ): {
   speakers: SpeakerEntry[];
   fullTranscript: string;
   transcripts: LegacyTranscriptSegment[];
 } {
-  console.log('[OPENAI] parseOpenAIDiarizationResponse called');
+  console.log('[OPENAI] parseOpenAIDiarizationResponse called', {
+    expectedSpeakerCount,
+    attendeeCount: attendeeNames.length,
+  });
 
   const fullTranscript = (rawResponse?.text || '').trim();
   const speakers: SpeakerEntry[] = [];
@@ -133,6 +141,10 @@ function parseOpenAIDiarizationResponse(
     rawResponse?.utterances ||
     [];
 
+  // 고유 화자 레이블(A, B, C 등) -> { speakerId, speakerDisplayName, speakerIndex } 일관 매핑 레지스트리
+  // 버그 수정: 세그먼트 인덱스(idx)를 화자 번호로 사용하지 않고, OpenAI가 반환한 실제 speaker label별로 단일 화자 ID를 부여합니다.
+  const speakerRegistry = new Map<string, { speakerId: string; speakerDisplayName: string; speakerIndex: number }>();
+
   if (Array.isArray(segmentsSource) && segmentsSource.length > 0) {
     segmentsSource.forEach((seg: any, idx: number) => {
       const segText = (seg.text || seg.transcript || '').trim();
@@ -140,31 +152,55 @@ function parseOpenAIDiarizationResponse(
 
       const startTime = typeof seg.start === 'number' ? seg.start : typeof seg.startTime === 'number' ? seg.startTime : 0;
       const endTime = typeof seg.end === 'number' ? seg.end : typeof seg.endTime === 'number' ? seg.endTime : startTime + 2;
-      
-      // 화자 식별자 정규화: "A" -> "화자 1", "speaker_0" -> "화자 1", "0" -> "화자 1"
-      let rawSpeaker = String(seg.speaker || seg.speaker_label || seg.speakerId || `화자 ${idx + 1}`).trim();
-      let speakerDisplayName = rawSpeaker;
 
-      if (/^[A-Z]$/.test(rawSpeaker)) {
-        // 알파벳 화자 레이블 (A -> 화자 1, B -> 화자 2 등)
-        const code = rawSpeaker.charCodeAt(0) - 64;
-        speakerDisplayName = `화자 ${code}`;
-      } else if (/^speaker[_-]?(\d+)$/i.test(rawSpeaker)) {
-        const num = parseInt(rawSpeaker.replace(/^speaker[_-]?/i, ''), 10);
-        speakerDisplayName = `화자 ${num + 1}`;
-      } else if (/^\d+$/.test(rawSpeaker)) {
-        speakerDisplayName = `화자 ${parseInt(rawSpeaker, 10) + 1}`;
-      } else if (!speakerDisplayName.startsWith('화자')) {
-        speakerDisplayName = `화자 ${speakerDisplayName}`;
+      // OpenAI가 반환한 원본 화자 레이블 (예: "A", "B", "speaker_0", "0")
+      const rawSpeaker = String(seg.speaker || seg.speaker_label || seg.speakerId || 'A').trim();
+
+      // [Requirement 2] Raw diarization 응답 진단 로그 출력 (개발자 콘솔 및 서버 로그)
+      console.log(`[diarization] ${startTime.toFixed(1)} - ${endTime.toFixed(1)} speaker=${rawSpeaker} text="${segText}"`);
+
+      let speakerId: string;
+      let speakerDisplayName: string;
+
+      if (expectedSpeakerCount === 1) {
+        // [Requirement 4] 1명 회의 모드: diarization 결과가 여러 speaker로 나오더라도 하나의 화자로 정규화
+        speakerId = 'speaker_1';
+        speakerDisplayName = '화자 1';
+      } else {
+        // [Requirement 1] OpenAI가 반환한 실제 speaker label을 기준으로 동일 화자를 묶음
+        if (!speakerRegistry.has(rawSpeaker)) {
+          let assignedNumber: number;
+
+          if (/^[A-Z]$/.test(rawSpeaker)) {
+            // 알파벳 화자 레이블 (A -> 1, B -> 2, C -> 3 등)
+            assignedNumber = rawSpeaker.charCodeAt(0) - 64;
+          } else if (/^speaker[_-]?(\d+)$/i.test(rawSpeaker)) {
+            const num = parseInt(rawSpeaker.replace(/^speaker[_-]?/i, ''), 10);
+            assignedNumber = num + 1;
+          } else if (/^\d+$/.test(rawSpeaker)) {
+            assignedNumber = parseInt(rawSpeaker, 10) + 1;
+          } else {
+            // 기타 임의 레이블은 발견 순서대로 인덱스 부여
+            assignedNumber = speakerRegistry.size + 1;
+          }
+
+          const mappedSpeakerId = `speaker_${assignedNumber}`;
+          const mappedDisplayName = `화자 ${assignedNumber}`;
+          speakerRegistry.set(rawSpeaker, {
+            speakerId: mappedSpeakerId,
+            speakerDisplayName: mappedDisplayName,
+            speakerIndex: assignedNumber,
+          });
+        }
+
+        const entry = speakerRegistry.get(rawSpeaker)!;
+        speakerId = entry.speakerId;
+        speakerDisplayName = entry.speakerDisplayName;
       }
 
-      // 화자 ID
-      const speakerId = `speaker_${idx + 1}`;
-
-      // 힌트가 있고 정확히 일치하는 경우에만 이름 매핑 (불명확 시 임의 부여 금지)
+      // 힌트가 있고 정확히 일치하는 경우 (참석자가 1명이고 예상화자 1명인 경우 등)
       let speakerName: string | undefined = undefined;
-      if (attendeeNames.length === 1 && segmentsSource.length > 0) {
-        // 단독 회의인 경우
+      if (attendeeNames.length === 1 && (expectedSpeakerCount === 1 || speakerRegistry.size <= 1)) {
         speakerName = attendeeNames[0];
       }
 
@@ -183,6 +219,10 @@ function parseOpenAIDiarizationResponse(
         speakerName: speakerName || speakerDisplayName,
         text: segText,
         originalAiText: segText,
+        originalText: segText,
+        editedText: segText,
+        correctionStatus: 'none',
+        rawSpeakerLabel: rawSpeaker,
         needsReview: false,
         confidence: typeof seg.confidence === 'number' ? seg.confidence : 0.95,
       });
@@ -218,6 +258,10 @@ function parseOpenAIDiarizationResponse(
         speakerName: speakerDisplayName,
         text: sentence,
         originalAiText: sentence,
+        originalText: sentence,
+        editedText: sentence,
+        correctionStatus: 'none',
+        rawSpeakerLabel: 'A',
         needsReview: false,
         confidence: 0.9,
       });
@@ -243,6 +287,7 @@ export async function transcribeAudioWithOpenAI(
     meetingTitle?: string;
     agenda?: string;
     attendeeNames?: string[];
+    expectedSpeakerCount?: number;
   } = {}
 ): Promise<OpenAITranscriptionResult> {
   const modelName = SERVER_CONFIG.openaiTranscribeModel;
@@ -297,7 +342,8 @@ export async function transcribeAudioWithOpenAI(
     // 3. 응답 파싱 및 화자 분리 데이터 생성
     const { speakers, fullTranscript, transcripts } = parseOpenAIDiarizationResponse(
       rawResponse,
-      context.attendeeNames || []
+      context.attendeeNames || [],
+      context.expectedSpeakerCount
     );
 
     return {

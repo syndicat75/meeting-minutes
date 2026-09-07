@@ -79,8 +79,15 @@ export interface TranscriptSegment {
   speakerId: string; // 예: "speaker_1", "speaker_2"
   speakerName?: string; // 매핑된 참석자 이름 (없으면 화자 1 등)
   text: string;
-  originalAiText?: string; // AI 원본
-  isUserEdited?: boolean; // 사용자 수정 여부
+  originalAiText?: string; // AI 최초 전사 원본 (보존)
+  originalText?: string; // AI 전사 원문
+  editedText?: string; // AI 교정 또는 사용자 수정 텍스트
+  correctionStatus?: 'none' | 'pending' | 'approved' | 'rejected'; // 교정 승인 상태
+  editedBy?: 'user' | 'ai_context' | 'none'; // 최종 수정자
+  editedAt?: string; // 수정 시각
+  correctionReason?: string; // AI 교정 사유
+  rawSpeakerLabel?: string; // OpenAI 원본 화자 라벨 (A, B 등)
+  isUserEdited?: boolean; // 사용자 직접 수정 여부
   needsReview: boolean; // 동시 발화, 불명확 구간, 들리지 않는 말 등
   confidence?: number;
   source?: 'manual' | 'ai_transcription' | 'openai' | 'gemini' | 'imported';
@@ -386,6 +393,8 @@ export interface Meeting {
   transcribedChunksCount?: number;
   transcripts: TranscriptSegment[];
   speakerMapping: Record<string, string>; // speakerId -> attendeeId
+  expectedSpeakerCount?: number; // 예상 참석 화자 수 (자동=0 또는 미지정, 1, 2, 3, 4, 5)
+  customTerms?: string[]; // 회의별 필수 보호 전문용어 사전
   
   // 요약
   summary?: MeetingSummary;

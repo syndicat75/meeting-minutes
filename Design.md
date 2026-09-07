@@ -513,6 +513,63 @@ AI 일괄 전사 요청 (동시 2개 청크 제한 워커 풀로 순차/병렬 �
    - 전사 성공 시 `transcriptionStatus = 'completed'` 및 `transcriptionCompletedAt`을 Firestore에 기록.
    - 전사 실패 시 `transcriptionStatus = 'failed'` 및 `errorMessage`를 기록하여 추후 개별 재시도가 가능하도록 보장.
 
+---
+
+## 13. 화자 과다 분리 개선 및 AI 전체 회의 문맥 기반 오탈자 교정 아키텍처 (Speaker Diarization Optimization & Contextual Correction)
+
+### 13.1. PART A: 화자 과다 분리(Over-Diarization) 문제 해결
+
+1. **OpenAI Diarization 원본 응답 정밀 분석 및 매핑 정규화 (`server/ai/openaiTranscription.ts`)**:
+   - `gpt-4o-transcribe-diarize` 모델의 `segments` 원본 응답에서 `speaker` 필드가 미지정되었거나 `null`, 빈 문자열인 경우 무조건 새로운 화자 ID를 생성하던 문제를 해결.
+   - 이전 세그먼트와 시간 간격이 0.8초 이내로 연속적이고 동일 문맥인 경우 앞선 화자로 자동 결속.
+   - `parseOpenAIDiarizationResponse`에서 원본 speaker label(예: `speaker_0`, `speaker_1`)을 정확하게 보존하고, 디버깅 진단 로그(`[diarization-segments]`)를 기록하여 세그먼트별 화자 파싱 결과를 추적할 수 있도록 개선.
+
+2. **예상 화자 수(`expectedSpeakerCount`) 힌트 및 후처리 휴리스틱 (`server/ai/openaiTranscription.ts`)**:
+   - 사용자가 지정한 `expectedSpeakerCount`(예: 1명 단독 회의, 2명 1:1 회의 등)를 전사 파이프라인에 전파.
+   - 단독 회의(`expectedSpeakerCount === 1`) 또는 60초 미만 단시간 녹음에서 화자가 과도하게 3명 이상으로 쪼개진 경우, 모든 발언을 `speaker_1`로 자동 단일화.
+   - 다자간 회의에서도 동일 화자의 연속 짧은 쉼표/추임새 구간이 서로 다른 화자로 분리되지 않도록 발언 간격 0.6초 이내 인접 세그먼트를 병합.
+
+3. **비정상 화자 분리 감지 경고 배너 (`src/components/meeting/transcript/DiarizationWarningBanner.tsx`)**:
+   - 녹음 시간 65초 이하의 짧은 회의에서 3명 이상의 화자가 감지된 경우, 상단에 부드러운 경고 배너를 자동 노출.
+   - [화자 1명으로 통합]: 원클릭으로 전체 발언을 단일 화자(또는 등록된 1인 참석자)로 일괄 통합.
+   - [화자 관리]: 상세 모달을 열어 수동으로 화자들을 병합하고 재배치할 수 있도록 유도.
+
+4. **전문 화자 일괄 관리 모달 (`src/components/meeting/transcript/SpeakerManagementModal.tsx`)**:
+   - 전체 감지된 화자 목록, 발언 횟수, 총 발언 시간 제공.
+   - 예상 화자 수(`expectedSpeakerCount`) 설정 및 저장.
+   - 다중 체크박스 선택 후 원하는 대상 화자로 일괄 병합(Merge) 실행.
+   - 각 화자를 실제 회의 참석자 명단과 즉각 연결하는 인라인 매핑 셀렉터 제공.
+
+---
+
+### 13.2. PART B: 전체 회의 문맥 검토 기반 AI 오탈자/문맥 교정 아키텍처
+
+1. **별도 LLM 분리 적용 (`OPENAI_CORRECTION_MODEL`)**:
+   - 음성 전사용 STT 모델(`gpt-4o-transcribe-diarize`)과 구분하여, 자연어 텍스트 문맥 추론에 특화된 `gpt-4o-mini` 모델을 백엔드 문맥 교정 엔진으로 지정 (`server/config.ts`).
+   - OpenAI 장애 시 Gemini 2.5 Flash가 지능적으로 Fallback 수행 (`server/ai/contextCorrectionService.ts`).
+
+2. **엄격한 5대 교정 원칙 (Strict Guardrails)**:
+   - **원칙 1 (원본 보존 원칙)**: 교정 실행 시 클라이언트의 원본 전사 데이터(`originalAiText`, `originalText`)는 결코 유실되지 않으며 영구 보존.
+   - **원칙 2 (사용자 직접 수정 보호)**: 사용자가 이미 직접 수정한 문장(`isUserEdited === true` 또는 `editedBy === 'user'`)은 AI 문맥 교정 대상에서 자동 제외되어 임의로 덮어쓰지 않음.
+   - **원칙 3 (환각/임의 창작 금지)**: 실제 발언에 없던 내용, 회의에 등장하지 않은 인물명, 금액, 기한, 안건을 AI가 임의로 창작/추가하는 행위 엄격 차단.
+   - **원칙 4 (고유명사/전문용어/숫자 보호)**: 인명, 부서명, 회사명, 설비명, 날짜, 금액, 퍼센트, 전문용어 사전(`customTerms`)에 등록된 단어는 왜곡 없이 100% 원문 형태 유지.
+   - **원칙 5 (불확실 발언 표기)**: 발음 뭉개짐이나 잡음으로 인해 맥락상 의미 파악이 모호한 구간은 멋대로 의역하지 않고 `[확인 필요]`로 명시하고 `needsReview: true` 플래그 설정.
+
+3. **전문용어 사전 관리 (`src/components/meeting/transcript/CustomTermsModal.tsx`)**:
+   - 회의별 특수 고유명사, 프로젝트 코드명, 부서명, 전문 기술 용어를 사용자가 등록/관리.
+   - AI 문맥 교정 시 시스템 프롬프트에 보호 용어 목록을 주입하여 오인식 교정 방지.
+
+4. **사전-사후 Diff 비교 및 검토 모달 (`src/components/meeting/transcript/AiCorrectionReviewModal.tsx`)**:
+   - AI가 제안한 변경 사항을 세그먼트별로 [원문] vs [AI 교정안], 교정 사유(예: 동음이의어 수정, 문맥상 오타 교정), 신뢰도와 함께 대조 표시.
+   - 사용자가 개별 문장별로 승인(체크) 또는 거절(원문 유지) 선택 가능.
+   - 전체 일괄 적용 또는 선택 항목만 선별 반영 가능.
+
+5. **개별 및 전체 원문 복원(Undo) 아키텍처 (`src/services/transcriptCorrectionClientService.ts`)**:
+   - 대화록 뷰에서 교정된 발언에 `[AI 문맥 교정됨]` 배지와 함께 [원문 비교] 버튼 제공.
+   - 개별 발언 단위로 [원문 복원] 지원.
+   - 툴바에서 [AI 교정 원문 복원] 원클릭 시 사용자가 직접 수정한 내용은 안전하게 보존한 채 AI 교정 내용만 최초 AI 원본으로 일괄 롤백.
+
+
 
 
 

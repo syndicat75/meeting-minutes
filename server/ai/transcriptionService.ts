@@ -22,6 +22,7 @@ export interface TranscribeAudioServiceOptions {
   meetingTitle?: string;
   agenda?: string;
   attendeeNames?: string[];
+  expectedSpeakerCount?: number;
   // 긴 회의 분할 청크 지원 (청크 시간 오프셋: 초 단위)
   timeOffsetSeconds?: number;
   chunkIndex?: number;
@@ -55,22 +56,24 @@ export function normalizeChunkSpeakersAndTime(
   transcripts: LegacyTranscriptSegment[],
   timeOffsetSeconds: number = 0,
   chunkIndex?: number,
-  attendeeNames: string[] = []
+  attendeeNames: string[] = [],
+  expectedSpeakerCount?: number
 ): { speakers: SpeakerEntry[]; transcripts: LegacyTranscriptSegment[] } {
   console.log('[TRANSCRIPTION_SERVICE] normalizeChunkSpeakersAndTime called', {
     timeOffsetSeconds,
     chunkIndex,
     speakerCount: speakers.length,
     segmentCount: transcripts.length,
+    expectedSpeakerCount,
   });
 
   const isMultiChunk = typeof chunkIndex === 'number' && chunkIndex >= 0;
-  const chunkPrefix = isMultiChunk ? `[${chunkIndex + 1}구간] ` : '';
+  const chunkPrefix = isMultiChunk && expectedSpeakerCount !== 1 ? `[${chunkIndex + 1}구간] ` : '';
 
   // 타임스탬프 보정 및 화자 레이블 조정
   const adjustedSpeakers: SpeakerEntry[] = speakers.map((spk) => {
     let speakerLabel = spk.speaker;
-    if (isMultiChunk && !speakerLabel.includes('구간')) {
+    if (isMultiChunk && expectedSpeakerCount !== 1 && !speakerLabel.includes('구간')) {
       speakerLabel = `${chunkPrefix}${spk.speaker}`;
     }
     return {
@@ -83,14 +86,22 @@ export function normalizeChunkSpeakersAndTime(
 
   const adjustedTranscripts: LegacyTranscriptSegment[] = transcripts.map((t, idx) => {
     let spkDisplayName = t.speakerName || t.speakerId;
-    if (isMultiChunk && !spkDisplayName.includes('구간')) {
+    if (isMultiChunk && expectedSpeakerCount !== 1 && !spkDisplayName.includes('구간')) {
       spkDisplayName = `${chunkPrefix}${spkDisplayName}`;
     }
 
     // 참석자가 1명이고 확실한 경우가 아니면 임의로 실제 참석자 이름을 부여하지 않음
     let speakerName = spkDisplayName;
-    if (attendeeNames.length === 1) {
+    if (attendeeNames.length === 1 && expectedSpeakerCount === 1) {
       speakerName = attendeeNames[0];
+    }
+
+    // 예상 화자 수가 1이면 chunk 구분 없이 항상 speaker_1로 통합
+    let assignedSpeakerId = t.speakerId;
+    if (expectedSpeakerCount === 1) {
+      assignedSpeakerId = 'speaker_1';
+    } else if (isMultiChunk) {
+      assignedSpeakerId = `chunk_${chunkIndex}_${t.speakerId}`;
     }
 
     return {
@@ -98,7 +109,7 @@ export function normalizeChunkSpeakersAndTime(
       id: `${t.id}-${chunkIndex ?? 0}-${idx}`,
       startSeconds: Math.round(t.startSeconds + timeOffsetSeconds),
       endSeconds: Math.round(t.endSeconds + timeOffsetSeconds),
-      speakerId: isMultiChunk ? `chunk_${chunkIndex}_${t.speakerId}` : t.speakerId,
+      speakerId: assignedSpeakerId,
       speakerName,
     };
   });
@@ -135,6 +146,7 @@ export async function executeTranscription(
     meetingTitle: options.meetingTitle,
     agenda: options.agenda,
     attendeeNames: options.attendeeNames,
+    expectedSpeakerCount: options.expectedSpeakerCount,
   };
 
   // 1. Primary가 OpenAI인 경우 (기본 구조)
@@ -151,7 +163,8 @@ export async function executeTranscription(
         openAiResult.transcripts,
         options.timeOffsetSeconds || 0,
         options.chunkIndex,
-        options.attendeeNames || []
+        options.attendeeNames || [],
+        options.expectedSpeakerCount
       );
 
       return {

@@ -46,6 +46,7 @@ export async function transcribeSingleChunk(
     meetingTitle?: string;
     agenda?: string;
     attendeeNames?: string[];
+    expectedSpeakerCount?: number;
   } = {}
 ): Promise<{
   transcripts: TranscriptSegment[];
@@ -56,6 +57,7 @@ export async function transcribeSingleChunk(
     meetingId,
     chunkId: chunk.id,
     startSeconds: chunk.startSeconds,
+    expectedSpeakerCount: meetingContext.expectedSpeakerCount,
   });
 
   const token = await getFirebaseIdToken();
@@ -87,6 +89,7 @@ export async function transcribeSingleChunk(
       meetingTitle: meetingContext.meetingTitle,
       agenda: meetingContext.agenda,
       attendeeNames: meetingContext.attendeeNames,
+      expectedSpeakerCount: meetingContext.expectedSpeakerCount,
     }),
   });
 
@@ -181,6 +184,7 @@ export async function transcribeAllChunks(
     meetingTitle?: string;
     agenda?: string;
     attendeeNames?: string[];
+    expectedSpeakerCount?: number;
   } = {},
   onProgress?: TranscriptionProgressCallback,
   retryOnlyFailed: boolean = false

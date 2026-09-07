@@ -439,6 +439,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
         meetingTitle: meeting.title,
         agenda: meeting.agenda,
         attendeeNames: meeting.attendees.map((a) => a.name),
+        expectedSpeakerCount: meeting.expectedSpeakerCount,
       });
 
       setChunks((prev) => {
@@ -484,6 +485,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
           meetingTitle: meeting.title,
           agenda: meeting.agenda,
           attendeeNames: meeting.attendees.map((a) => a.name),
+          expectedSpeakerCount: meeting.expectedSpeakerCount,
         },
         (completed, total, percent, label) => {
           setTranscribeProgressPercent(percent);
@@ -923,6 +925,25 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
                     <span>실패 구간({failedTranscribeCount}) 재전사</span>
                   </button>
                 )}
+
+                {/* 예상 화자 수 설정 (1명/2명/다자 등) */}
+                <div className="flex items-center space-x-1.5 bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-lg">
+                  <span className="text-[11px] font-semibold text-slate-600">예상 화자:</span>
+                  <select
+                    disabled={isTranscribing || isReadOnly}
+                    value={meeting.expectedSpeakerCount || 0}
+                    onChange={(e) => onUpdateMeeting({ expectedSpeakerCount: parseInt(e.target.value, 10) })}
+                    className="text-xs bg-transparent border-0 font-medium text-slate-800 focus:ring-0 p-0 cursor-pointer"
+                    title="실제 발언 예상 인원수를 지정하면 화자 과다 분리를 방지할 수 있습니다."
+                  >
+                    <option value={0}>자동 감지</option>
+                    <option value={1}>1명 (단독 회의)</option>
+                    <option value={2}>2명 (1:1 회의)</option>
+                    <option value={3}>3명</option>
+                    <option value={4}>4명</option>
+                    <option value={5}>5명 이상</option>
+                  </select>
+                </div>
 
                 <div className="relative group">
                   <button

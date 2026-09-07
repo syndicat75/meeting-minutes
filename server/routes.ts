@@ -22,6 +22,7 @@ import {
 import { summarizeMeetingWithGemini } from './gemini.js';
 import { executeTranscription } from './ai/transcriptionService.js';
 import { generateMeetingSummary } from './ai/meetingSummaryService.js';
+import { executeContextCorrection } from './ai/contextCorrectionService.js';
 
 export const apiRouter = express.Router();
 
@@ -402,6 +403,10 @@ apiRouter.post(
       const endSeconds = typeof req.body.endSeconds === 'number' ? req.body.endSeconds : startSeconds + 300;
       const meetingTitle = req.body.meetingTitle || '';
       const agenda = req.body.agenda || '';
+      const expectedSpeakerCount =
+        typeof req.body.expectedSpeakerCount === 'number' && req.body.expectedSpeakerCount > 0
+          ? req.body.expectedSpeakerCount
+          : undefined;
       let attendeeNames: string[] = [];
 
       if (req.body.attendeeNames) {
@@ -524,6 +529,7 @@ apiRouter.post(
         meetingTitle,
         agenda,
         attendeeNames,
+        expectedSpeakerCount,
         timeOffsetSeconds: startSeconds,
         chunkIndex,
       });
@@ -675,3 +681,92 @@ apiRouter.post(
     }
   }
 );
+
+/**
+ * 대화록 AI 문맥 검토 및 오타 교정 엔드포인트: POST /api/ai/correct-transcript
+ * 분리된 별도 텍스트 모델(gpt-4o-mini 또는 gemini-3.6-flash)을 통해
+ * 전체 회의 문맥, 안건, 참석자 명단, 전문용어 사전을 기반으로 음성인식 오탈자 교정안을 제안합니다.
+ */
+apiRouter.post(
+  '/ai/correct-transcript',
+  async (req: AuthenticatedRequest, res: Response) => {
+    console.log('[ROUTES] POST /api/ai/correct-transcript called');
+
+    try {
+      // 1. 인증 확인
+      const authHeader = req.headers.authorization;
+      const token = extractBearerToken(authHeader);
+
+      if (!token) {
+        return res.status(401).json({
+          success: false,
+          error: '인증이 필요합니다. 먼저 로그인해주세요.',
+          detail: 'UNAUTHORIZED',
+        });
+      }
+
+      const user = await verifyFirebaseIdToken(token);
+      req.user = user;
+
+      const meetingId = String(req.body.meetingId || '').trim();
+      const meetingTitle = String(req.body.meetingTitle || req.body.title || '회의').trim();
+      const agenda = String(req.body.agenda || '').trim();
+      const department = String(req.body.department || '').trim();
+      const attendees = Array.isArray(req.body.attendees) ? req.body.attendees : [];
+      const customTerms = Array.isArray(req.body.customTerms) ? req.body.customTerms : [];
+      const correctionLevel = req.body.correctionLevel || 'context';
+      const excludeUserEdited = req.body.excludeUserEdited ?? true;
+      const segments = Array.isArray(req.body.segments) ? req.body.segments : [];
+
+      if (!meetingId) {
+        return res.status(400).json({
+          success: false,
+          error: 'meetingId는 필수 항목입니다.',
+          detail: 'MISSING_MEETING_ID',
+        });
+      }
+
+      if (segments.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: '교정할 대화록 세그먼트(segments)가 비어 있습니다.',
+          detail: 'EMPTY_SEGMENTS',
+        });
+      }
+
+      // 2. 권한 확인
+      const hasAccess = await verifyMeetingAccess(user.uid, meetingId, token);
+      if (!hasAccess) {
+        return res.status(403).json({
+          success: false,
+          error: '해당 회의에 대한 접근 권한이 없습니다.',
+          detail: 'FORBIDDEN',
+        });
+      }
+
+      // 3. 문맥 교정 실행
+      const result = await executeContextCorrection({
+        meetingId,
+        meetingTitle,
+        agenda,
+        department,
+        attendees,
+        customTerms,
+        correctionLevel,
+        excludeUserEdited,
+        segments,
+      });
+
+      return res.json(result);
+    } catch (err: any) {
+      console.error('[ROUTES] POST /api/ai/correct-transcript failed', err);
+      const statusCode = err.statusCode || 500;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'AI 문맥 교정 처리 중 오류가 발생했습니다.',
+        detail: err.detail || err.details || err.code || String(err),
+      });
+    }
+  }
+);
+

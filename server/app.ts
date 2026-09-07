@@ -32,10 +32,8 @@ export function createApp(): express.Application {
     next();
   });
 
-  // Vercel Serverless Function 및 Express 환경 호환을 위해 /api 및 루트 양쪽으로 라우터 마운트
-  // Vercel rewrite로 /api prefix가 유지되거나 제거되더라도 동일하게 라우팅 보장
+  // Vercel Serverless Function 및 Express 환경 호환을 위해 /api 라우터 마운트
   app.use('/api', apiRouter);
-  app.use('/', apiRouter);
 
   // 미매칭 API 경로 404 핸들러
   app.use('/api/*', (req: Request, res: Response) => {
