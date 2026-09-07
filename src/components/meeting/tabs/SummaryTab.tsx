@@ -99,7 +99,7 @@ export const SummaryTab: React.FC<SummaryTabProps> = ({
       }
     } catch (err: any) {
       logger.error('Failed to generate summary', err);
-      setGenerateError(`요약 생성 실패: ${err?.message || '알 수 없는 오류'}`);
+      setGenerateError(err?.message || '회의록 요약 생성 중 알 수 없는 오류가 발생했습니다.');
     } finally {
       setIsGenerating(false);
     }

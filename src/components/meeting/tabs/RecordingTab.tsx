@@ -276,7 +276,7 @@ export const RecordingTab: React.FC<RecordingTabProps> = ({
       onSwitchToTranscriptTab();
     } catch (err: any) {
       logger.error('Transcription failed', err);
-      setTranscribeError(`AI 음성 전사 실패: ${err?.message || '알 수 없는 오류'}`);
+      setTranscribeError(err?.message || 'AI 음성 전사 처리 중 알 수 없는 오류가 발생했습니다.');
     } finally {
       setIsTranscribing(false);
     }

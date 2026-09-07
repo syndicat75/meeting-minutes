@@ -338,6 +338,29 @@ export const subscribeAuthChanges = subscribeAuthState;
 export const loginWithGoogle = signInWithGoogle;
 
 /**
+ * 현재 로그인된 사용자의 Firebase ID 토큰을 취득하는 헬퍼 함수
+ * @param {boolean} [forceRefresh=false] 토큰 강제 갱신 여부
+ * @returns {Promise<string | null>} 유효한 JWT ID 토큰 또는 미로그인 시 null
+ */
+export async function getCurrentUserIdToken(forceRefresh: boolean = false): Promise<string | null> {
+  logger.info('getCurrentUserIdToken called', { forceRefresh });
+  const auth = getFirebaseAuth();
+  if (!auth || !auth.currentUser) {
+    logger.warn('No active Firebase user logged in');
+    return null;
+  }
+
+  try {
+    const token = await auth.currentUser.getIdToken(forceRefresh);
+    logger.info('Firebase ID token acquired successfully');
+    return token;
+  } catch (err: any) {
+    logger.error('Failed to get Firebase ID token', err);
+    return null;
+  }
+}
+
+/**
  * 현재 Firebase 연결 상태 반환
  */
 export function getFirebaseStatus(): FirebaseConnectionStatus {

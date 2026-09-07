@@ -146,3 +146,74 @@
 5. **Google 인증 오류 상세 진단**:
    - `parseFirebaseAuthError`를 통해 `auth/popup-blocked`, `auth/unauthorized-domain`, `auth/network-request-failed` 등의 에러 코드를 한국어 상세 안내 및 해결 방법(팝업 차단 해제, 승인된 도메인 등록 등)으로 즉각 변환하여 사용자에게 제공합니다.
 
+---
+
+## 8. Vercel 서버리스 배포 및 AI API 아키텍처 (Vercel Serverless & AI Engine)
+
+### 8.1. Vercel 프로젝트 설정 (Project Settings)
+- **Framework Preset**: `Vite`
+- **Root Directory**: `./` (프로젝트 루트)
+- **Build Command**: `vite build`
+- **Output Directory**: `dist`
+- **Node.js Version**: `20.x` 또는 `22.x`
+
+### 8.2. 서버리스 함수 분리 및 라우팅 구조 (`vercel.json`)
+Vercel에서 Vite SPA 화면과 Express 백엔드 API를 동시에 배포할 때, `/api/*` 요청이 SPA의 `index.html`로 rewrite되어 404 또는 HTML 파싱 오류가 발생하는 문제를 원천 방지하기 위해 다음과 같이 구성합니다:
+
+```json
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
+  "framework": "vite",
+  "buildCommand": "vite build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 60,
+      "memory": 1024
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
+```
+
+- **엔트리포인트 매핑**:
+  - `api/index.ts`: Vercel Serverless Function 진입점으로 `server/app.ts`의 Express 앱을 직접 export합니다.
+  - `server.ts`: Cloud Run 컨테이너 및 로컬 개발용 엔트리포인트로 동일한 `server/app.ts`를 가져와 포트 3000에서 Vite 개발 미들웨어 또는 정적 서빙과 함께 구동됩니다.
+- **경로 정규화**:
+  - Express 라우터는 `app.use('/api', apiRouter)`와 `app.use('/', apiRouter)`에 동시 마운트되어, Vercel의 URL rewrite 방식에 구애받지 않고 `/api/health`, `/health`, `/api/ai/transcribe`, `/ai/transcribe`를 일관되게 처리합니다.
+
+### 8.3. Gemini API 키 보안 원칙
+1. **서버 전용 격리**: `GEMINI_API_KEY`는 반드시 서버 백엔드(`process.env.GEMINI_API_KEY`)에서만 참조하며, 브라우저 번들이나 `VITE_` 접두사 환경변수에 절대 포함시키지 않습니다.
+2. **키 누락 시 명확한 에러 반환**: `GEMINI_API_KEY`가 설정되지 않은 경우 가짜(mock) 성공 응답을 반환하지 않고, HTTP 503 (`GEMINI_API_KEY_NOT_CONFIGURED`) 상태와 함께 Vercel 환경변수 등록 안내 메시지를 즉시 응답합니다.
+
+### 8.4. 가짜 성공(Mock Fallback) 제거 및 데이터 진실성 원칙
+- 실제 오디오 파일이 제공되지 않았거나 Gemini 모델 분석을 수행하지 않은 경우, 예시 대화록이나 샘플 요약을 임의로 반환하지 않습니다.
+- 오디오가 없으면 HTTP 400 (`NO_AUDIO_DATA`), 추론 실패 시 HTTP 502 (`GEMINI_INFERENCE_ERROR`)로 실패 처리하여 데이터의 신뢰성과 법적 증빙 효력을 유지합니다.
+
+### 8.5. 대용량 오디오 전달 및 플랫폼 한도 준수 전략
+1. **Vercel 본문 한도(4.5MB) 보호**:
+   - Vercel Serverless Function은 최대 4.5MB의 HTTP 요청 본문 한도를 가집니다.
+   - 따라서 클라이언트(`RecordingTab.tsx`, `storageService.ts`)는 녹음 완료 시 Firebase Storage로 선업로드(`meetings/{meetingId}/recordings/*`)한 후, 서버에는 파일 경로(`audioStoragePath`)와 메타데이터만 전송합니다.
+2. **서버 측 스토리지 다운로드 및 SSRF 방지**:
+   - 서버는 전달받은 `audioStoragePath`가 `meetings/${meetingId}/recordings/[a-zA-Z0-9_.-]+.(webm|mp4|wav|mp3|m4a)` 패턴과 정확히 일치하는지 검증합니다.
+   - 디렉터리 트래버설(`..`)이나 타 회의 경로, 외부 도메인 URL 조회를 엄격히 차단합니다.
+3. **실행 시간 및 파일 크기 한도**:
+   - Vercel Serverless Function 최대 실행 시간: 60초 (`maxDuration: 60`).
+   - 일반 회의 녹음(10~30분)은 Gemini 2.5 Flash에서 약 5~15초 내에 신속히 전사됩니다.
+   - 1시간을 초과하는 대용량/장시간 녹음은 클라우드 작업 큐(Cloud Tasks 또는 QStash) 및 비동기 Webhook 아키텍처를 도입하여 클라이언트가 폴링하는 구조로 확장 배포할 수 있습니다.
+
+### 8.6. 진단 및 상태 점검 (`/api/health`)
+- `GET /api/health` 호출 시 비밀키 노출 없이 서버 동작 여부, Gemini 키 설정 유무(`geminiConfigured`), Firebase 설정 유무(`firebaseConfigured`), 모델명, 용량 한도를 JSON으로 제공합니다.
+- 프런트엔드는 404(배포 경로 오류/HTML 응답), 401(미로그인 인증 필요), 403(권한 오류), 503(키 미설정), 500/502(AI 처리 실패)를 시각적으로 명확히 분기하여 사용자에게 표시하며, 404 오류 시 무한 반복 재시도를 수행하지 않습니다.
+
+
