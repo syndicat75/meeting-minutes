@@ -89,7 +89,7 @@ export function getFirebaseConfig(): FirebaseClientConfig | null {
 
 /**
  * 전사 및 요약에 사용할 AI 모델 및 한도 설정
- * 공식 확인된 안정 모델: gemini-2.5-flash
+ * 공식 권장 최신 모델: gemini-3.6-flash
  */
 export const APP_CONFIG = {
   appName: 'AI 회의록 관리',
@@ -97,10 +97,10 @@ export const APP_CONFIG = {
   defaultMeetingTitle: '남부권역 위험성평가 위원회',
   
   ai: {
-    // 음성 전사 모델 (공식 안정 모델)
-    transcriptionModel: 'gemini-2.5-flash',
+    // 음성 전사 모델 (공식 권장 최신 모델)
+    transcriptionModel: 'gemini-3.6-flash',
     // 요약 및 양식 생성 모델
-    summaryModel: 'gemini-2.5-flash',
+    summaryModel: 'gemini-3.6-flash',
     // 백오프 재시도 설정
     maxRetries: 3,
     initialRetryDelayMs: 2000,

@@ -11,8 +11,11 @@ dotenv.config();
  * 서버 전역 설정 상수 객체
  */
 export const SERVER_CONFIG = {
-  // 사용 AI 모델 (Gemini 2.5 Flash: 빠른 전사 속도 및 구조화 JSON 지원)
-  geminiModel: 'gemini-2.5-flash',
+  // 사용 AI 모델 (Gemini 3.6 Flash: 최신 안정 모델, GEMINI_MODEL 환경변수로 재지정 가능)
+  geminiModel: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+
+  // 지원 및 허용되는 최신 fallback 모델 목록 (구형 gemini-2.5-flash 배제)
+  fallbackModels: [process.env.GEMINI_MODEL || 'gemini-3.6-flash'],
 
   // 포트 번호 (Cloud Run 및 로컬 개발 환경용)
   port: 3000,
@@ -55,6 +58,7 @@ export const SERVER_CONFIG = {
  */
 export function getServerEnv(): {
   geminiApiKey: string | undefined;
+  geminiModel: string;
   firebaseProjectId: string | undefined;
   firebaseStorageBucket: string | undefined;
   firebaseApiKey: string | undefined;
@@ -62,6 +66,7 @@ export function getServerEnv(): {
   console.log('[CONFIG] getServerEnv called');
   return {
     geminiApiKey: process.env.GEMINI_API_KEY,
+    geminiModel: process.env.GEMINI_MODEL || SERVER_CONFIG.geminiModel,
     firebaseProjectId: process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID,
     firebaseStorageBucket: process.env.FIREBASE_STORAGE_BUCKET || process.env.VITE_FIREBASE_STORAGE_BUCKET,
     firebaseApiKey: process.env.FIREBASE_API_KEY || process.env.VITE_FIREBASE_API_KEY,

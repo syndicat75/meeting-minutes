@@ -128,7 +128,27 @@ async function parseServerResponse(response: Response, actionName: string): Prom
       error: errorMsg,
       detail: body?.detail || body?.details,
       status: response.status,
+      fullBody: body,
     });
+
+    const isModelNotFound =
+      response.status === 404 ||
+      body?.code === 'MODEL_NOT_FOUND' ||
+      (typeof errorMsg === 'string' &&
+        (errorMsg.includes('모델') ||
+          errorMsg.includes('model') ||
+          errorMsg.includes('NOT_FOUND') ||
+          errorMsg.includes('no longer available'))) ||
+      (typeof body?.detail === 'string' &&
+        (body.detail.includes('model') ||
+          body.detail.includes('NOT_FOUND') ||
+          body.detail.includes('no longer available')));
+
+    if (isModelNotFound) {
+      throw new Error(
+        '현재 설정된 AI 모델을 사용할 수 없습니다. 관리자에게 Gemini 모델 설정 확인을 요청해주세요.'
+      );
+    }
 
     if (response.status === 401 || response.status === 403) {
       throw new Error(`Gemini API 인증 오류: ${errorMsg}${detailMsg}`);

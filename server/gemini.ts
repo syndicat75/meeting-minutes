@@ -1,11 +1,18 @@
 /**
  * @file server/gemini.ts
- * @description Google Gemini 2.5 Flash 기반 음성 전사(STT) 및 회의록 구조화 요약 AI 모듈.
+ * @description Google Gemini 3.6 Flash 기반 음성 전사(STT) 및 회의록 구조화 요약 AI 모듈.
  * 가짜(Mock) 성공 응답을 일절 배제하고, 실제 AI 모델 추론만을 수행하며, 키 미설정 시 명확한 503 에러를 반환합니다.
  */
 
 import { GoogleGenAI, Type, Schema } from '@google/genai';
 import { getServerEnv, SERVER_CONFIG } from './config.js';
+
+/**
+ * 서버 전역 Gemini 모델 설정
+ * Vercel 및 로컬 환경변수(GEMINI_MODEL)를 최우선으로 적용하며, 기본값은 gemini-3.6-flash 입니다.
+ */
+export const GEMINI_MODEL: string =
+  process.env.GEMINI_MODEL || SERVER_CONFIG.geminiModel || 'gemini-3.6-flash';
 
 /**
  * Gemini 클라이언트 지연 초기화 인스턴스
@@ -90,7 +97,7 @@ function parseTimeStringToSeconds(timeStr: string | undefined, fallback: number 
 }
 
 /**
- * 음성 버퍼를 Gemini 2.5 Flash 모델로 전송하여 화자별 대화록으로 전사
+ * 음성 버퍼를 Gemini 3.6 Flash 모델로 전송하여 화자별 대화록으로 전사
  * @param {Buffer} audioBuffer 오디오 원시 바이너리 데이터
  * @param {string} mimeType 오디오 MIME 타입 (예: audio/webm, audio/webm;codecs=opus)
  * @param {object} meetingContext 회의 컨텍스트 정보 (제목, 안건, 참석자 명단)
@@ -105,11 +112,7 @@ export async function transcribeAudioWithGemini(
     attendeeNames?: string[];
   }
 ): Promise<TranscriptionResult> {
-  console.log('[GEMINI] transcribeAudioWithGemini called', {
-    bufferBytes: audioBuffer.length,
-    rawMimeType: mimeType,
-    meetingTitle: meetingContext.meetingTitle,
-  });
+  console.log('[transcription] Gemini model:', GEMINI_MODEL);
 
   if (!audioBuffer || audioBuffer.length === 0) {
     const error: any = new Error('전사할 오디오 버퍼가 비어 있습니다.');
@@ -121,7 +124,13 @@ export async function transcribeAudioWithGemini(
   // 1. MIME 타입 정규화: audio/webm;codecs=opus -> audio/webm
   const rawMime = mimeType || 'audio/webm';
   const normalizedMimeType = rawMime.split(';')[0].trim().toLowerCase() || 'audio/webm';
-  console.log('[GEMINI] Normalized MIME type for Gemini inlineData:', normalizedMimeType);
+
+  console.log('[transcription] request', {
+    model: GEMINI_MODEL,
+    mimeType: normalizedMimeType,
+    fileSize: audioBuffer.length,
+    meetingTitle: meetingContext.meetingTitle,
+  });
 
   const ai = getGeminiClient();
   const base64Audio = audioBuffer.toString('base64');
@@ -175,7 +184,7 @@ export async function transcribeAudioWithGemini(
 
   try {
     const response = await ai.models.generateContent({
-      model: SERVER_CONFIG.geminiModel,
+      model: GEMINI_MODEL,
       contents: [
         {
           role: 'user',
@@ -280,7 +289,7 @@ export async function transcribeAudioWithGemini(
     const errorMessage = err?.message || String(err);
 
     console.error('[transcription] Diagnostics:', {
-      model: SERVER_CONFIG.geminiModel,
+      model: GEMINI_MODEL,
       mimeType: normalizedMimeType,
       fileSizeBytes: audioBuffer.length,
       httpStatus,
@@ -290,7 +299,18 @@ export async function transcribeAudioWithGemini(
     let mappedStatusCode = 500;
     let userErrorMessage = 'AI 음성 전사 처리 중 서버 오류가 발생했습니다.';
 
-    if (httpStatus === 401 || httpStatus === 403) {
+    const isModelNotFound =
+      httpStatus === 404 ||
+      errorMessage.includes('NOT_FOUND') ||
+      errorMessage.includes('no longer available') ||
+      (errorMessage.toLowerCase().includes('model') &&
+        (errorMessage.includes('404') || errorMessage.includes('not found')));
+
+    if (isModelNotFound) {
+      mappedStatusCode = 404;
+      userErrorMessage =
+        '현재 설정된 AI 모델을 사용할 수 없습니다. 관리자에게 Gemini 모델 설정 확인을 요청해주세요.';
+    } else if (httpStatus === 401 || httpStatus === 403) {
       mappedStatusCode = 401;
       userErrorMessage = 'Gemini API 인증 오류가 발생했습니다. 서버 API Key를 확인해주세요.';
     } else if (httpStatus === 429) {
@@ -376,6 +396,8 @@ export async function summarizeMeetingWithGemini(payload: {
 [실제 대화록 본문]
 ${formattedTranscript}
 `;
+
+  console.log('[summary] Gemini model:', GEMINI_MODEL);
 
   const summarySchema: Schema = {
     type: Type.OBJECT,
@@ -469,7 +491,7 @@ ${formattedTranscript}
 
   try {
     const response = await ai.models.generateContent({
-      model: SERVER_CONFIG.geminiModel,
+      model: GEMINI_MODEL,
       contents: [{ role: 'user', parts: [{ text: systemPrompt }] }],
       config: {
         responseMimeType: 'application/json',
@@ -502,12 +524,33 @@ ${formattedTranscript}
       isReviewedByUser: false,
     };
 
-    console.log('[GEMINI] Meeting summary generated successfully');
+    console.log('[GEMINI] Meeting summary generated successfully with model:', GEMINI_MODEL);
     return resultSummary;
   } catch (err: any) {
     if (err.statusCode) throw err;
     console.error('[GEMINI] Meeting summarization API error', err);
-    const error: any = new Error(`Gemini AI 회의록 요약 처리 실패: ${err?.message || '알 수 없는 오류'}`);
+
+    const errorMessage = err?.message || String(err);
+    const httpStatus = err?.status || err?.statusCode || (errorMessage.includes('404') ? 404 : 500);
+
+    const isModelNotFound =
+      httpStatus === 404 ||
+      errorMessage.includes('NOT_FOUND') ||
+      errorMessage.includes('no longer available') ||
+      (errorMessage.toLowerCase().includes('model') &&
+        (errorMessage.includes('404') || errorMessage.includes('not found')));
+
+    if (isModelNotFound) {
+      const error: any = new Error(
+        '현재 설정된 AI 모델을 사용할 수 없습니다. 관리자에게 Gemini 모델 설정 확인을 요청해주세요.'
+      );
+      error.statusCode = 404;
+      error.code = 'MODEL_NOT_FOUND';
+      error.details = errorMessage;
+      throw error;
+    }
+
+    const error: any = new Error(`Gemini AI 회의록 요약 처리 실패: ${errorMessage}`);
     error.statusCode = 502;
     error.code = 'GEMINI_INFERENCE_ERROR';
     error.details = String(err);

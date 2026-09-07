@@ -37,7 +37,7 @@
 ├── Design.md                       # 본 앱 구조 및 아키텍처 설계 문서
 ├── src/
 │   ├── config/
-│   │   └── appConfig.ts            # 모델명(gemini-2.5-flash), API 키, 스토리지 키 중앙 집중 설정
+│   │   └── appConfig.ts            # 모델명(gemini-3.6-flash), API 키, 스토리지 키 중앙 집중 설정
 │   ├── types/
 │   │   ├── meeting.ts              # 회의, 참석자, 대화록, 요약, 서명, 사진 TypeScript 인터페이스
 │   │   └── auth.ts                 # 사용자 인증 및 Firebase 연결 상태 인터페이스
@@ -243,6 +243,23 @@ Vercel에서 Vite SPA 화면과 Express 백엔드 API를 동시에 배포할 때
 3. **API 진입점 라우팅 일관성**:
    - `vercel.json`의 rewrites (`/api/(.*)` -> `/api`)를 통해 모든 API 요청이 단일 Express 진입점인 `api/index.ts`로 수렴됩니다.
    - `GET /api` 및 `GET /`에 대한 루트 안내 엔드포인트를 제공하여 모듈 로딩 및 헬스 상태를 즉각 진단할 수 있습니다.
+
+### 8.9. Gemini 3.6 Flash 모델 중앙화 및 404 Model Not Found 에러 제어
+1. **단일 중앙 모델 설정 (`GEMINI_MODEL`)**:
+   - `server/config.ts` 및 `server/gemini.ts`에서 `process.env.GEMINI_MODEL || 'gemini-3.6-flash'`로 통합 관리.
+   - Vercel 환경변수(`GEMINI_MODEL=gemini-3.6-flash`)를 통해 코드 수정 없이 모델 동적 교체 가능.
+   - API 키는 서버 전용 환경변수로 격리하여 브라우저에 일절 노출되지 않음.
+2. **구형 모델(gemini-2.5-flash) 제거 및 Fallback 체인 정비**:
+   - 신규 사용자 접근이 중단된 `gemini-2.5-flash` 모델을 전사 및 요약 등 전체 AI 기능에서 완전히 배제.
+   - fallback 목록에서도 지원 중단 모델을 제거하여 불필요한 실패 요청 방지.
+3. **상세 로깅 및 진단**:
+   - 전사 요청 시: `console.log("[transcription] Gemini model:", GEMINI_MODEL);`
+   - 메타데이터 로깅: `console.log("[transcription] request", { model: GEMINI_MODEL, mimeType: normalizedMimeType, fileSize: audioBuffer.length });`
+   - API 키는 어떠한 로그에도 기록되지 않도록 엄격히 차단.
+4. **Gemini 404 모델 에러 사용자 친화적 메시지 처리**:
+   - Gemini API에서 404/NOT_FOUND 또는 'no longer available' 발생 시 단순 "서버 내부 오류"가 아닌 "현재 설정된 AI 모델을 사용할 수 없습니다. 관리자에게 Gemini 모델 설정 확인을 요청해주세요." 안내 표출.
+   - 개발자 로그에는 실제 오류 전체를 상세 기록하여 즉각적인 원인 파악 지원.
+
 
 
 

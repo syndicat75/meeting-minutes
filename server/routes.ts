@@ -218,7 +218,7 @@ apiRouter.post(
         });
       }
 
-      // 6. Gemini 2.5 Flash 모델 전사 실행
+      // 6. Gemini 3.6 Flash 모델 전사 실행
       const result = await transcribeAudioWithGemini(audioBuffer, mimeType, {
         meetingTitle,
         agenda,
