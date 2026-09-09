@@ -28,6 +28,7 @@ import {
   MeetingContentRow,
   ActionItem,
 } from '../../../types/meeting';
+import { UniversalMeetingContent } from '../content/UniversalMeetingContent';
 import { requestComprehensiveMeetingSummary } from '../../../services/transcriptionClientService';
 import { logger } from '../../../utils/logger';
 
@@ -235,100 +236,24 @@ export const SummaryTab: React.FC<SummaryTabProps> = ({
         </div>
       )}
 
-      {/* 1. 회의록 양식의 핵심: '구분 / 내용' 본문 표 (인쇄 시 들어갈 메인 표) */}
+      {/* 1. 범용 회의록 본문 작성 시스템 (구분, 화자, 내용, 다중 뷰, 컬럼 설정, 템플릿) */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-4">
         <div className="flex items-center justify-between border-b border-slate-100 pb-3">
           <div>
-            <h4 className="text-sm font-bold text-slate-900">회의 내용 (구분 / 내용 표)</h4>
+            <h4 className="text-sm font-bold text-slate-900">회의 내용 (범용 회의록 본문)</h4>
             <p className="text-xs text-slate-500">
-              최종 인쇄 회의록의 '회의 내용' 표에 출력되는 표준 항목입니다.
+              구분, 화자, 내용을 기본으로 자유롭게 컬럼과 뷰(표형, 카드형, 안건별, 타임라인)를 구성할 수 있습니다.
             </p>
           </div>
           <span className="text-xs font-semibold px-2.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
-            총 {(meeting.contentRows || []).length}개 항목
+            총 {(meeting.meetingRows || meeting.contentRows || []).length}개 항목
           </span>
         </div>
 
-        {/* 표 목록 */}
-        <div className="border border-slate-200 rounded-lg overflow-hidden">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-slate-100 border-b border-slate-200 text-slate-700 font-bold">
-              <tr>
-                <th className="py-2.5 px-3 w-40">구분</th>
-                <th className="py-2.5 px-3">회의 내용 및 심의 결과</th>
-                {!isReadOnly && <th className="py-2.5 px-3 w-16 text-center">삭제</th>}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {(meeting.contentRows || []).map((row) => (
-                <tr key={row.id} className="hover:bg-slate-50">
-                  <td className="p-2.5 align-top">
-                    <input
-                      type="text"
-                      disabled={isReadOnly}
-                      value={row.category}
-                      onChange={(e) => handleUpdateContentRow(row.id, e.target.value, row.content)}
-                      className="w-full p-1.5 font-semibold text-slate-900 bg-white border border-slate-200 rounded focus:ring-1 focus:ring-blue-500 disabled:bg-transparent disabled:border-none"
-                    />
-                  </td>
-                  <td className="p-2.5">
-                    <textarea
-                      rows={3}
-                      disabled={isReadOnly}
-                      value={row.content}
-                      onChange={(e) => handleUpdateContentRow(row.id, row.category, e.target.value)}
-                      className="w-full p-1.5 text-slate-800 bg-white border border-slate-200 rounded focus:ring-1 focus:ring-blue-500 disabled:bg-transparent disabled:border-none leading-relaxed"
-                    />
-                  </td>
-                  {!isReadOnly && (
-                    <td className="p-2.5 text-center align-top">
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteContentRow(row.id)}
-                        className="p-1.5 text-slate-400 hover:text-red-600 rounded hover:bg-slate-100"
-                        title="행 삭제"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </td>
-                  )}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        {/* 새 행 추가 폼 */}
-        {!isReadOnly && (
-          <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
-            <span className="text-xs font-bold text-slate-800 flex items-center">
-              <Plus className="w-3.5 h-3.5 mr-1 text-blue-600" />새 항목 추가
-            </span>
-            <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-              <input
-                type="text"
-                placeholder="구분 (예: 안건 심의)"
-                value={newCategory}
-                onChange={(e) => setNewCategory(e.target.value)}
-                className="text-xs p-2 bg-white border border-slate-200 rounded"
-              />
-              <input
-                type="text"
-                placeholder="내용 입력..."
-                value={newContent}
-                onChange={(e) => setNewContent(e.target.value)}
-                className="text-xs p-2 bg-white border border-slate-200 rounded sm:col-span-2"
-              />
-              <button
-                type="button"
-                onClick={handleAddContentRow}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold rounded"
-              >
-                행 추가
-              </button>
-            </div>
-          </div>
-        )}
+        <UniversalMeetingContent
+          meeting={meeting}
+          onUpdateMeeting={onUpdateMeeting}
+        />
       </div>
 
       {/* 2. AI 구조화 요약 카드들 (핵심 요약, 결정사항, 미결사항, 후속조치) */}

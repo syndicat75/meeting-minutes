@@ -23,6 +23,11 @@ import { summarizeMeetingWithGemini } from './gemini.js';
 import { executeTranscription } from './ai/transcriptionService.js';
 import { generateMeetingSummary } from './ai/meetingSummaryService.js';
 import { executeContextCorrection } from './ai/contextCorrectionService.js';
+import {
+  classifyCategoriesWithAI,
+  detectAgendasWithAI,
+  structureMeetingRowsWithAI,
+} from './ai/meetingStructureService.js';
 
 export const apiRouter = express.Router();
 
@@ -769,4 +774,163 @@ apiRouter.post(
     }
   }
 );
+
+/**
+ * AI 구분 자동 분류 엔드포인트: POST /api/ai/classify-categories
+ */
+apiRouter.post(
+  '/ai/classify-categories',
+  async (req: AuthenticatedRequest, res: Response) => {
+    console.log('[ROUTES] POST /api/ai/classify-categories called');
+    try {
+      const authHeader = req.headers.authorization;
+      const token = extractBearerToken(authHeader);
+      if (token) {
+        try {
+          const user = await verifyFirebaseIdToken(token);
+          req.user = user;
+        } catch {
+          // 비회원 로컬 테스트 지원 허용
+        }
+      }
+
+      const meetingTitle = String(req.body.meetingTitle || '').trim();
+      const agenda = String(req.body.agenda || '').trim();
+      const availableCategories = Array.isArray(req.body.availableCategories)
+        ? req.body.availableCategories
+        : ['개회', '보고사항', '논의', '질의', '답변', '결정사항', '조치사항', '폐회'];
+      const items = Array.isArray(req.body.items) ? req.body.items : [];
+
+      const result = await classifyCategoriesWithAI({
+        meetingTitle,
+        agenda,
+        availableCategories,
+        items,
+      });
+
+      return res.json({
+        success: true,
+        suggestions: result,
+      });
+    } catch (err: any) {
+      console.error('[ROUTES] POST /api/ai/classify-categories failed', err);
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'AI 구분 분류 중 오류가 발생했습니다.',
+        detail: err.detail || String(err),
+      });
+    }
+  }
+);
+
+/**
+ * AI 안건 감지 및 그룹화 엔드포인트: POST /api/ai/detect-agendas
+ */
+apiRouter.post(
+  '/ai/detect-agendas',
+  async (req: AuthenticatedRequest, res: Response) => {
+    console.log('[ROUTES] POST /api/ai/detect-agendas called');
+    try {
+      const authHeader = req.headers.authorization;
+      const token = extractBearerToken(authHeader);
+      if (token) {
+        try {
+          const user = await verifyFirebaseIdToken(token);
+          req.user = user;
+        } catch {
+          // 비회원 허용
+        }
+      }
+
+      const meetingTitle = String(req.body.meetingTitle || '').trim();
+      const agenda = String(req.body.agenda || '').trim();
+      const items = Array.isArray(req.body.items) ? req.body.items : [];
+
+      const result = await detectAgendasWithAI({
+        meetingTitle,
+        agenda,
+        items,
+      });
+
+      return res.json({
+        success: true,
+        agendas: result,
+      });
+    } catch (err: any) {
+      console.error('[ROUTES] POST /api/ai/detect-agendas failed', err);
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'AI 안건 감지 중 오류가 발생했습니다.',
+        detail: err.detail || String(err),
+      });
+    }
+  }
+);
+
+/**
+ * AI 회의록 자동 구조화(MeetingRow[] 합성) 엔드포인트: POST /api/ai/structure-meeting-rows
+ */
+apiRouter.post(
+  '/ai/structure-meeting-rows',
+  async (req: AuthenticatedRequest, res: Response) => {
+    console.log('[ROUTES] POST /api/ai/structure-meeting-rows called');
+    try {
+      const authHeader = req.headers.authorization;
+      const token = extractBearerToken(authHeader);
+      if (token) {
+        try {
+          const user = await verifyFirebaseIdToken(token);
+          req.user = user;
+        } catch {
+          // 비회원 허용
+        }
+      }
+
+      const meetingTitle = String(req.body.meetingTitle || '').trim();
+      const agenda = String(req.body.agenda || '').trim();
+      const department = String(req.body.department || '').trim();
+      const date = String(req.body.date || '').trim();
+      const attendees = Array.isArray(req.body.attendees) ? req.body.attendees : [];
+      const availableCategories = Array.isArray(req.body.availableCategories)
+        ? req.body.availableCategories
+        : ['보고사항', '논의', '결정사항', '조치사항'];
+      const fullTranscript = String(req.body.fullTranscript || '').trim();
+      const manualEntries = Array.isArray(req.body.manualEntries) ? req.body.manualEntries : [];
+      const existingRows = Array.isArray(req.body.existingRows) ? req.body.existingRows : [];
+
+      if (!fullTranscript && manualEntries.length === 0 && existingRows.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: '분석할 회의 전사 내용 또는 직접 작성 발언이 없습니다.',
+          detail: 'EMPTY_CONTENT',
+        });
+      }
+
+      const result = await structureMeetingRowsWithAI({
+        meetingTitle,
+        agenda,
+        department,
+        date,
+        attendees,
+        availableCategories,
+        fullTranscript,
+        manualEntries,
+        existingRows,
+      });
+
+      return res.json({
+        success: true,
+        rows: result,
+      });
+    } catch (err: any) {
+      console.error('[ROUTES] POST /api/ai/structure-meeting-rows failed', err);
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'AI 회의록 구조화 중 오류가 발생했습니다.',
+        detail: err.detail || String(err),
+      });
+    }
+  }
+);
+
 

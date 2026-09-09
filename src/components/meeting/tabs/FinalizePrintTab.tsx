@@ -56,20 +56,58 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
   const signedAttendees = meeting.attendees.filter((a) => a.signatures && a.signatures.length > 0);
   const unsignedAttendees = meeting.attendees.filter((a) => !a.signatures || a.signatures.length === 0);
 
-  // 내용 작성 여부 (본문 행 또는 직접 작성 발언/자유 메모)
+  // 내용 작성 여부 (범용 회의록 행, 본문 행 또는 직접 작성 발언/자유 메모)
   const hasMeetingContent = Boolean(
+    (meeting.meetingRows && meeting.meetingRows.length > 0) ||
     (meeting.contentRows && meeting.contentRows.length > 0) ||
     (meeting.manualEntries && meeting.manualEntries.length > 0) ||
     (meeting.freeformMemo && meeting.freeformMemo.trim().length > 0)
   );
 
-  const contentCountDesc = meeting.contentRows && meeting.contentRows.length > 0
+  const contentCountDesc = meeting.meetingRows && meeting.meetingRows.length > 0
+    ? `회의록 항목: ${meeting.meetingRows.length}건`
+    : meeting.contentRows && meeting.contentRows.length > 0
     ? `본문 표: ${meeting.contentRows.length}건`
     : meeting.manualEntries && meeting.manualEntries.length > 0
     ? `직접 작성 발언: ${meeting.manualEntries.length}건`
     : meeting.freeformMemo && meeting.freeformMemo.trim().length > 0
     ? '자유 메모 작성 완료'
     : '회의 내용 미작성';
+
+  // 인쇄용 회의록 행 및 동적 컬럼 계산
+  const printRows = (meeting.meetingRows && meeting.meetingRows.length > 0)
+    ? meeting.meetingRows
+    : (meeting.contentRows || []).map((cr, idx) => ({
+        id: cr.id,
+        order: idx,
+        category: cr.category,
+        speakerName: '',
+        content: cr.content,
+      }));
+
+  const visiblePrintCols = (meeting.meetingColumns && meeting.meetingColumns.length > 0
+    ? meeting.meetingColumns
+    : [
+        { id: 'c_cat', key: 'category', label: '구분', type: 'text' as const, visible: true, order: 0 },
+        { id: 'c_spk', key: 'speakerName', label: '화자', type: 'text' as const, visible: true, order: 1 },
+        { id: 'c_cnt', key: 'content', label: '회의 내용 및 심의 결과', type: 'longtext' as const, visible: true, order: 2 },
+      ]
+  ).filter((c) => c.visible);
+
+  const mergeCategoryCells = meeting.meetingViewConfig?.mergeCategoryCells ?? true;
+  const categoryRowSpans: Record<number, number> = {};
+  if (mergeCategoryCells && printRows.length > 0) {
+    let i = 0;
+    while (i < printRows.length) {
+      const currentCat = printRows[i].category;
+      let count = 1;
+      while (i + count < printRows.length && printRows[i + count].category === currentCat) {
+        count++;
+      }
+      categoryRowSpans[i] = count;
+      i += count;
+    }
+  }
 
   // 누락 검증 체크리스트 항목들
   const checklist = [
@@ -302,7 +340,7 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
             {meeting.title || '회 의 록'}
           </h1>
           <p className="text-xs text-slate-600 mt-1">
-            (산업안전보건법 및 위험성평가 위원회 운영 규정 준수 표준 회의록)
+            {meeting.department ? `${meeting.department} 공식 회의록` : '공식 회의록'}
           </p>
         </div>
 
@@ -393,7 +431,7 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
           </table>
         </div>
 
-        {/* 3. 회의 내용 및 심의 결과 표 (구분 / 내용 표 또는 직접 작성 회의록) */}
+        {/* 3. 회의 내용 및 심의 결과 표 (범용 회의록 표) */}
         <div className="mb-6">
           <h2 className="text-sm font-bold text-slate-900 mb-2">
             ■ 회의 내용 및 심의·의결 결과
@@ -401,36 +439,164 @@ export const FinalizePrintTab: React.FC<FinalizePrintTabProps> = ({
           <table className="w-full border-collapse border border-slate-900 text-xs">
             <thead>
               <tr className="bg-slate-100 font-bold text-center">
-                <th className="border border-slate-900 p-2 w-36">구분</th>
-                <th className="border border-slate-900 p-2">회의 내용 및 심의 결과</th>
+                {visiblePrintCols.map((col) => (
+                  <th
+                    key={col.id}
+                    style={{ width: col.width || 'auto' }}
+                    className="border border-slate-900 p-2"
+                  >
+                    {col.label}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
-              {meeting.contentRows && meeting.contentRows.length > 0 ? (
-                meeting.contentRows.map((row) => (
-                  <tr key={row.id}>
-                    <td className="border border-slate-900 p-2.5 font-bold text-slate-800 align-top text-center">
-                      {row.category}
-                    </td>
-                    <td className="border border-slate-900 p-2.5 whitespace-pre-wrap leading-relaxed">
-                      {row.content}
-                    </td>
-                  </tr>
-                ))
+              {printRows.length > 0 ? (
+                printRows.map((row, idx) => {
+                  const shouldRenderCategory = !mergeCategoryCells || categoryRowSpans[idx] !== undefined;
+                  const rowSpan = mergeCategoryCells ? categoryRowSpans[idx] : 1;
+
+                  return (
+                    <tr key={row.id}>
+                      {visiblePrintCols.map((col) => {
+                        // 구분(Category) 셀 병합 처리
+                        if (col.key === 'category') {
+                          if (!shouldRenderCategory) return null;
+                          return (
+                            <td
+                              key={col.id}
+                              rowSpan={rowSpan}
+                              className="border border-slate-900 p-2.5 font-bold text-slate-800 align-top text-center"
+                            >
+                              {row.category}
+                            </td>
+                          );
+                        }
+
+                        // 화자(Speaker)
+                        if (col.key === 'speakerName') {
+                          return (
+                            <td
+                              key={col.id}
+                              className="border border-slate-900 p-2.5 align-top font-semibold text-center whitespace-nowrap"
+                            >
+                              {row.speakerName || '-'}
+                            </td>
+                          );
+                        }
+
+                        // 회의 내용(Content)
+                        if (col.key === 'content') {
+                          return (
+                            <td
+                              key={col.id}
+                              className="border border-slate-900 p-2.5 whitespace-pre-wrap leading-relaxed align-top"
+                            >
+                              {row.content}
+                            </td>
+                          );
+                        }
+
+                        // 상위 안건
+                        if (col.key === 'agendaTitle') {
+                          return (
+                            <td
+                              key={col.id}
+                              className="border border-slate-900 p-2.5 align-top text-center"
+                            >
+                              {row.agendaTitle || '-'}
+                            </td>
+                          );
+                        }
+
+                        // 결정사항
+                        if (col.key === 'decision') {
+                          return (
+                            <td
+                              key={col.id}
+                              className="border border-slate-900 p-2.5 align-top font-semibold"
+                            >
+                              {row.decision || '-'}
+                            </td>
+                          );
+                        }
+
+                        // 조치과제
+                        if (col.key === 'actionItemTask') {
+                          return (
+                            <td
+                              key={col.id}
+                              className="border border-slate-900 p-2.5 align-top"
+                            >
+                              {row.actionItemTask || '-'}
+                            </td>
+                          );
+                        }
+
+                        // 담당자
+                        if (col.key === 'assignee') {
+                          return (
+                            <td
+                              key={col.id}
+                              className="border border-slate-900 p-2.5 align-top text-center whitespace-nowrap"
+                            >
+                              {row.assignee || '-'}
+                            </td>
+                          );
+                        }
+
+                        // 기한
+                        if (col.key === 'dueDate') {
+                          return (
+                            <td
+                              key={col.id}
+                              className="border border-slate-900 p-2.5 align-top text-center whitespace-nowrap font-mono"
+                            >
+                              {row.dueDate || '-'}
+                            </td>
+                          );
+                        }
+
+                        // 사용자 정의 컬럼
+                        const customVal = row.customFields?.[col.key];
+                        return (
+                          <td
+                            key={col.id}
+                            className="border border-slate-900 p-2.5 align-top"
+                          >
+                            {customVal !== undefined && customVal !== null
+                              ? typeof customVal === 'boolean'
+                                ? customVal
+                                  ? '✓'
+                                  : '-'
+                                : String(customVal)
+                              : '-'}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })
               ) : meeting.manualEntries && meeting.manualEntries.length > 0 ? (
-                meeting.manualEntries.map((entry, idx) => (
+                meeting.manualEntries.map((entry) => (
                   <tr key={entry.id}>
                     <td className="border border-slate-900 p-2.5 font-bold text-slate-800 align-top text-center">
                       {entry.speakerName}
                     </td>
-                    <td className="border border-slate-900 p-2.5 whitespace-pre-wrap leading-relaxed">
+                    <td
+                      colSpan={visiblePrintCols.length > 1 ? visiblePrintCols.length - 1 : 1}
+                      className="border border-slate-900 p-2.5 whitespace-pre-wrap leading-relaxed"
+                    >
                       {entry.text}
                     </td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td colSpan={2} className="border border-slate-900 p-4 text-center text-slate-400">
+                  <td
+                    colSpan={visiblePrintCols.length || 2}
+                    className="border border-slate-900 p-4 text-center text-slate-400"
+                  >
                     기록된 회의 내용이 없습니다.
                   </td>
                 </tr>

@@ -4,6 +4,13 @@
  */
 
 import { logger } from '../utils/logger';
+export * from './meetingUniversal';
+import {
+  MeetingRow,
+  MeetingAgenda,
+  ColumnDefinition,
+  MeetingViewSettings,
+} from './meetingUniversal';
 
 /**
  * 회의 진행 상태
@@ -91,6 +98,10 @@ export interface TranscriptSegment {
   needsReview: boolean; // 동시 발화, 불명확 구간, 들리지 않는 말 등
   confidence?: number;
   source?: 'manual' | 'ai_transcription' | 'openai' | 'gemini' | 'imported';
+  category?: string; // 발언 구분 (예: 개회, 논의, 질의, 답변, 결정사항 등)
+  suggestedCategory?: string; // AI가 제안한 발언 구분
+  categoryReason?: string; // AI 구분 제안 사유
+  agendaId?: string; // 연동된 상위 안건 ID
 }
 
 /**
@@ -370,8 +381,14 @@ export interface Meeting {
   ownerEmail?: string;
   permissions: MeetingPermissions;
   
-  // 회의 내용 표
+  // 회의 내용 표 (기존 레거시 호환 및 신규 범용 시스템 병행)
   contentRows: MeetingContentRow[];
+  meetingRows?: MeetingRow[]; // 범용 회의록 행 목록 (구분-화자-내용 및 확장 필드)
+  meetingAgendas?: MeetingAgenda[]; // 상위 안건 목록
+  meetingCategories?: string[]; // 해당 회의 전용 구분(Category) 목록
+  meetingColumns?: ColumnDefinition[]; // 회의록 컬럼 구성 (사용자 정의 컬럼 포함)
+  meetingTemplateId?: string; // 적용된 템플릿 ID (예: 'general_business', 'risk_assessment' 등)
+  meetingViewConfig?: MeetingViewSettings; // 화면 및 인쇄 뷰 설정
   
   // 참석자 목록
   attendees: Attendee[];
@@ -424,8 +441,13 @@ export interface Meeting {
  * @param ownerUid 소유자 UID
  * @returns 기본 양식이 채워진 Meeting 객체
  */
-export function createDefaultMeeting(authorName: string = '관리자', ownerUid: string = 'local_user'): Meeting {
-  logger.info('createDefaultMeeting called', { authorName, ownerUid });
+export function createDefaultMeeting(
+  authorName: string = '관리자',
+  ownerUid: string = 'local_user',
+  templateId: string = 'general_business',
+  customTitle?: string
+): Meeting {
+  logger.info('createDefaultMeeting called', { authorName, ownerUid, templateId });
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
   const startTime = '14:00';
@@ -433,46 +455,50 @@ export function createDefaultMeeting(authorName: string = '관리자', ownerUid:
   const newId = 'm_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
 
   const defaultAttendees: Attendee[] = [
-    { id: 'att_1', role: '위원장', position: '공장장', name: '김철수', order: 0, signatures: [] },
-    { id: 'att_2', role: '사용자위원', position: '안전보건팀장', name: '이영희', order: 1, signatures: [] },
-    { id: 'att_3', role: '사용자위원', position: '생산관리팀장', name: '박민수', order: 2, signatures: [] },
-    { id: 'att_4', role: '근로자위원', position: '근로자대표', name: '정대현', order: 3, signatures: [] },
-    { id: 'att_5', role: '근로자위원', position: '정비반장', name: '최준호', order: 4, signatures: [] },
-    { id: 'att_6', role: '근로자위원', position: '현장안전원', name: '강동원', order: 5, signatures: [] },
-    { id: 'att_7', role: '간사', position: '안전관리자', name: authorName || '홍길동', order: 6, signatures: [] },
+    { id: 'att_1', role: '주관자', position: '팀장', name: authorName || '홍길동', order: 0, signatures: [] },
   ];
 
   const defaultContentRows: MeetingContentRow[] = [
     {
       id: 'row_1',
-      category: '개회 및 경과보고',
-      content: '2026년도 상반기 남부권역 사업장 위험성평가 정기추진 결과 및 부서별 사전점검 실적 보고',
+      category: '보고사항',
+      content: '전회 회의 결정사항 이행 점검 및 주요 진행 현황 보고',
       order: 0,
     },
     {
       id: 'row_2',
-      category: '안건 심의',
-      content: '1. 프레스 및 혼합기 구역 방호울 센서 개선안\n2. 물류 이동 동선 지게차-보행자 분리 방안 심의\n3. 하절기 밀폐공간 유해가스 측정 및 비상대응훈련 계획',
+      category: '논의',
+      content: '1. 신규 분기 업무 계획 및 현안 이슈 검토\n2. 부서 간 협조 사항 및 프로세스 개선 방안 논의',
       order: 1,
     },
     {
       id: 'row_3',
-      category: '결정 및 조치사항',
-      content: '- 프레스 센서 인터록 교체(안전팀/3월말한)\n- 통로 안전펜스 및 바닥 유도선 재도색(총무팀/즉시)\n- 밀폐공간 송기마스크 추가 구비(구매팀)',
+      category: '결정사항',
+      content: '- 안건별 개선 추진안 확정\n- 부서별 세부 실행 계획 수립 및 차기 회의 보고',
       order: 2,
     },
   ];
 
+  const defaultMeetingRows: MeetingRow[] = defaultContentRows.map((cr, idx) => ({
+    id: cr.id,
+    order: idx,
+    category: cr.category,
+    speakerName: authorName,
+    content: cr.content,
+    source: 'manual',
+    isUserEdited: true,
+  }));
+
   return {
     id: newId,
-    title: '남부권역 위험성평가 위원회',
+    title: customTitle || '정기 업무 회의',
     date: dateStr,
     startTime,
     endTime,
-    location: '남부사업소 대회의실 (본관 2층)',
-    department: '남부권역 제조본부 / 안전보건관리팀',
+    location: '본사 대회의실',
+    department: '경영지원본부',
     author: authorName,
-    agenda: '2026년도 상반기 정기 위험성평가 실시결과 심의 및 유해위험요인 개선대책 확정',
+    agenda: '부서별 주요 현안 공유 및 분기 실행 계획 심의',
     status: 'draft',
     currentVersion: 1,
     ownerId: ownerUid,
@@ -480,6 +506,21 @@ export function createDefaultMeeting(authorName: string = '관리자', ownerUid:
       [ownerUid]: 'owner',
     },
     contentRows: defaultContentRows,
+    meetingRows: defaultMeetingRows,
+    meetingTemplateId: templateId,
+    meetingCategories: [
+      '보고사항',
+      '진행사항',
+      '문제점',
+      '논의',
+      '질의',
+      '답변',
+      '의견',
+      '결정사항',
+      '조치사항',
+      '기타의견',
+      '폐회',
+    ],
     attendees: defaultAttendees,
     manualEntries: [],
     freeformMemo: '',

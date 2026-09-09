@@ -23,6 +23,7 @@ import {
   MeetingStatus,
   createDefaultMeeting,
 } from '../types/meeting';
+import { ensureMeetingUniversalFields, getMeetingTemplateById } from '../config/meetingTemplates';
 import { STORAGE_KEYS } from '../config/appConfig';
 import { logger } from '../utils/logger';
 
@@ -30,17 +31,44 @@ export const MEETINGS_COLLECTION = 'meetings';
 
 /**
  * 새 회의 템플릿 생성 어댑터
- * App.tsx에서 전달하는 (ownerUid, authorName) 인수를 createDefaultMeeting(authorName, ownerUid)에 올바르게 매핑합니다.
  * @param ownerUid 소유자 UID (Firebase 로그인 사용자 UID 또는 'local_user')
  * @param authorName 작성자 성명 (표시 이름 또는 '관리자')
+ * @param templateId 선택한 회의 유형 템플릿 ID (기본값: 'general_business')
+ * @param customTitle 사용자가 지정한 회의 제목
  * @returns {Meeting} 초기화된 회의 객체
  */
 export function createNewMeetingTemplate(
   ownerUid: string = 'local_user',
-  authorName: string = '관리자'
+  authorName: string = '관리자',
+  templateId: string = 'general_business',
+  customTitle?: string
 ): Meeting {
-  logger.info('createNewMeetingTemplate called', { ownerUid, authorName });
-  return createDefaultMeeting(authorName, ownerUid);
+  logger.info('createNewMeetingTemplate called', { ownerUid, authorName, templateId });
+  const selectedTemplate = getMeetingTemplateById(templateId);
+  const title = customTitle || (selectedTemplate ? selectedTemplate.name : '정기 회의');
+  const base = createDefaultMeeting(authorName, ownerUid, templateId, title);
+
+  if (selectedTemplate) {
+    base.meetingCategories = [...selectedTemplate.categories];
+    base.meetingColumns = [...selectedTemplate.defaultColumns];
+    if (selectedTemplate.defaultAgendas && selectedTemplate.defaultAgendas.length > 0) {
+      base.meetingAgendas = selectedTemplate.defaultAgendas.map((a, idx) => ({
+        id: `agenda_${Date.now()}_${idx}`,
+        title: a.title,
+        order: a.order,
+      }));
+    }
+    if (selectedTemplate.defaultPrintViewMode) {
+      base.meetingViewConfig = {
+        contentViewMode: 'table',
+        printViewMode: selectedTemplate.defaultPrintViewMode,
+        mergeCategoryCells: selectedTemplate.mergeCategoryCells ?? true,
+        visibleColumnKeys: selectedTemplate.defaultColumns.filter((c) => c.visible).map((c) => c.key),
+      };
+    }
+  }
+
+  return ensureMeetingUniversalFields(base);
 }
 
 /**
@@ -182,13 +210,13 @@ export async function fetchMeetings(userUid: string = 'local_user'): Promise<Mee
     });
 
     logger.info('fetchMeetings completed successfully', { totalCount: mergedList.length, cloudCount: cloudMeetings.length });
-    return mergedList;
+    return mergedList.map((m) => ensureMeetingUniversalFields(m));
   } catch (err: any) {
     logger.error('fetchMeetings from Firestore failed', { error: err?.message });
     // 다른 계정의 캐시를 노출하지 않고, 현재 계정 본인 소유 또는 로컬 초안만 반환
-    return local.filter(
-      (m) => !m.isDeleted && (m.ownerId === userUid || (m.permissions && m.permissions[userUid]) || isLocalDraftMeeting(m))
-    );
+    return local
+      .filter((m) => !m.isDeleted && (m.ownerId === userUid || (m.permissions && m.permissions[userUid]) || isLocalDraftMeeting(m)))
+      .map((m) => ensureMeetingUniversalFields(m));
   }
 }
 
